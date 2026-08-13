@@ -469,7 +469,7 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         </section>
 
         <section id="transfer" className="wide-section dark-section">
-          <div className="section-head light"><span>03 / DATA MOVEMENT</span><h2>拖动 pid，看尾块怎样被 mask。</h2><p>设定 N 与 BLOCK_SIZE，观察 GM → UB → ALU → GM 的完整生命周期。</p></div>
+          <div className="section-head light"><span>03 / DATA MOVEMENT</span><h2>切换 1D / 2D / 3D，看每个 block 怎样搬。</h2><p>逐轴设定 shape、BLOCK_SIZE 与 program_id，观察 X、Y 从 GM 进入 UB、并行相加并把 C 写回 GM 的完整生命周期。</p></div>
           <TransferLab />
         </section>
 
