@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
+import { KERNEL_GROUPS, KERNEL_OPS, TOTAL_TRITON_KERNELS } from "./kernel-ops";
 
 const SOURCE = {
   quick: "https://github.com/triton-lang/triton-ascend/blob/main/docs/en/quick_start.md",
@@ -450,30 +451,55 @@ X_tile 元素数
 }
 
 function CaseSimulator() {
-  const [kind, setKind] = useState("rms");
-  const [values, setValues] = useState("1,2,3,4");
-  const nums = useMemo(() => values.split(/[,\s]+/).map(Number).filter(Number.isFinite).slice(0, 8), [values]);
-  const steps = useMemo(() => {
-    if (!nums.length) return ["请输入数字"];
-    if (kind === "rms") {
-      const squares = nums.map((x) => x * x);
-      const variance = squares.reduce((a, b) => a + b, 0) / nums.length;
-      const rstd = 1 / Math.sqrt(variance + 1e-6);
-      return [`x² = [${squares.map(x => x.toFixed(2)).join(", ")}]`, `mean(x²) = ${variance.toFixed(4)}`, `rsqrt(var+eps) = ${rstd.toFixed(4)}`, `y = [${nums.map(x => (x * rstd).toFixed(4)).join(", ")}]`];
-    }
-    if (kind === "swiglu") {
-      const even = nums.filter((_, i) => i % 2 === 0);
-      const odd = nums.filter((_, i) => i % 2 === 1);
-      const out = even.slice(0, odd.length).map((g, i) => g * (1 / (1 + Math.exp(-g))) * (odd[i] + 1));
-      return [`gate = 偶数列 [${even.join(", ")}]`, `up = 奇数列 [${odd.join(", ")}]`, `SiLU(gate) = [${even.map(g => (g / (1 + Math.exp(-g))).toFixed(4)).join(", ")}]`, `out = SiLU(gate) × (up+1) = [${out.map(x => x.toFixed(4)).join(", ")}]`];
-    }
-    const max = Math.max(...nums); const arg = nums.indexOf(max); const exps = nums.map(x => Math.exp(x - max)); const sum = exps.reduce((a, b) => a + b, 0);
-    return [`m = max(logits) = ${max}，argmax = ${arg}`, `exp(x-m) = [${exps.map(x => x.toFixed(4)).join(", ")}]`, `sumexp = ${sum.toFixed(4)}`, `P(argmax) = 1/sumexp = ${(1 / sum).toFixed(4)}`];
-  }, [kind, nums]);
+  const [group, setGroup] = useState("全部");
+  const [selectedId, setSelectedId] = useState(KERNEL_OPS[0].id);
+  const [kernelIndex, setKernelIndex] = useState(0);
+  const [phase, setPhase] = useState(0);
+  const [query, setQuery] = useState("");
+  const visible = useMemo(() => KERNEL_OPS.filter(op => (group === "全部" || op.group === group) && (`${op.title} ${op.module} ${op.kernels.join(" ")}`.toLowerCase().includes(query.toLowerCase()))), [group, query]);
+  const selected = visible.find(op => op.id === selectedId) ?? visible[0] ?? KERNEL_OPS.find(op => op.id === selectedId) ?? KERNEL_OPS[0];
+  const selectedKernel = selected.kernels[Math.min(kernelIndex, selected.kernels.length - 1)];
+  const phases = [
+    { key:"GM", title:"01 · GM 输入与任务定位", detail:`当前 kernel：${selectedKernel}。${selected.input}。Grid：${selected.grid}` },
+    { key:"LOAD", title:"02 · GM → UB 搬运", detail:`${selectedKernel}：${selected.load}` },
+    { key:"UB", title:"03 · UB 工作 Tile", detail:`${selected.tile}。这里只显示 ${selectedKernel} 的一个 program 当前一轮处理的工作 tile。` },
+    { key:"COMPUTE", title:"04 · 片上计算", detail:`${selectedKernel}：${selected.compute}` },
+    { key:"STORE", title:"05 · UB → GM 写回", detail:`${selectedKernel}：${selected.store}` },
+    { key:"TORCH", title:"06 · PyTorch 语义对照", detail:selected.torch },
+  ];
+  const select = (id: string) => { setSelectedId(id); setKernelIndex(0); setPhase(0); };
   return (
-    <div className="case-sim">
-      <div className="sim-inputs"><div><span>算子</span>{[["rms", "RMSNorm"], ["swiglu", "SwiGLU"], ["softmax", "Argmax+Softmax"]].map(([id, name]) => <button key={id} className={kind === id ? "active" : ""} onClick={() => setKind(id)}>{name}</button>)}</div><label>输入小张量 <input value={values} onChange={(e) => setValues(e.target.value)} aria-label="逗号分隔的小张量数值" /></label></div>
-      <div className="calc-pipeline">{steps.map((s, i) => <div key={s}><b>0{i + 1}</b><span>{s}</span></div>)}</div>
+    <div className="kernel-atlas">
+      <div className="kernel-atlas-head">
+        <div><span>UPSTREAM INVENTORY · MAIN</span><strong>{KERNEL_OPS.length} modules · {TOTAL_TRITON_KERNELS} kernels</strong><p>统计范围：<code>python/sgl_kernel_npu/sgl_kernel_npu</code> 中含 <code>@triton.jit</code> 的模块；同一公开算子的内部 kernel 合并为一个模拟条目。</p></div>
+        <label>查找算子 / kernel<input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="例如 rmsnorm / decode / cache" /></label>
+      </div>
+      <div className="kernel-group-tabs" aria-label="算子分类">{KERNEL_GROUPS.map(g => <button key={g} className={group === g ? "active" : ""} onClick={() => {
+        const next = g === "全部" ? KERNEL_OPS[0] : KERNEL_OPS.find(op => op.group === g) ?? KERNEL_OPS[0];
+        setGroup(g); setQuery(""); setSelectedId(next.id); setKernelIndex(0); setPhase(0);
+      }}>{g}<small>{g === "全部" ? KERNEL_OPS.length : KERNEL_OPS.filter(op => op.group === g).length}</small></button>)}</div>
+      <div className="kernel-workbench">
+        <aside className="kernel-catalog" aria-label="Triton 算子目录">
+          <div><span>{visible.length} 个模块</span><b>点击切换模拟</b></div>
+          {visible.map(op => <button key={op.id} className={selected.id === op.id ? "active" : ""} onClick={() => select(op.id)}><small>{op.module}</small><b>{op.title}</b><em>{op.kernels.length} kernel{op.kernels.length > 1 ? "s" : ""}</em></button>)}
+          {!visible.length && <p>没有匹配的算子。</p>}
+        </aside>
+        <div className="kernel-stage">
+          <header><div><span>{selected.group}</span><h3>{selected.title}</h3><code>{selected.module}</code></div><a href={`https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/sgl_kernel_npu/${selected.module}`} target="_blank" rel="noreferrer">源码 ↗</a></header>
+          <div className="kernel-name-list"><span>选择本模块的 JIT kernel</span>{selected.kernels.map((name, i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { setKernelIndex(i); setPhase(0); }}><code>{name}</code></button>)}</div>
+          <div className="kernel-phase-tabs">{phases.map((item, i) => <button key={item.key} className={phase === i ? "active" : phase > i ? "done" : ""} onClick={() => setPhase(i)}><b>{item.key}</b><span>{i + 1}</span></button>)}</div>
+          <div className="kernel-memory-sim">
+            <div className={`kernel-memory gm ${phase === 0 || phase === 1 || phase === 4 ? "active" : ""}`}><small>GLOBAL MEMORY</small><b>{phase < 4 ? "输入张量 / page / state" : "输出目标地址"}</b><div>{Array.from({ length: 12 }, (_, i) => <i key={i} className={i < (phase === 0 ? 4 : 8) ? "hot" : ""}>{i}</i>)}</div></div>
+            <div className={`kernel-bus ${phase === 1 ? "active" : ""}`}><span>GM → UB</span><i /></div>
+            <div className={`kernel-memory ub ${phase >= 2 && phase <= 4 ? "active" : ""}`}><small>UNIFIED BUFFER / REG</small><b>{phase === 3 ? "正在计算" : "当前 task 的单张 tile"}</b><div>{Array.from({ length: 12 }, (_, i) => <i key={i} className={phase >= 2 && i < 8 ? phase === 3 ? "calc" : "hot" : ""}>{phase === 3 && i < 8 ? "ƒ" : i}</i>)}</div></div>
+            <div className={`kernel-bus back ${phase === 4 ? "active" : ""}`}><span>UB → GM</span><i /></div>
+            <div className={`kernel-memory out ${phase >= 4 ? "active" : ""}`}><small>OUTPUT / UPDATED STATE</small><b>{phase >= 4 ? "已写回的有效结果" : "等待写回"}</b><div>{Array.from({ length: 12 }, (_, i) => <i key={i} className={phase >= 4 && i < 8 ? "hot" : ""}>{phase >= 4 && i < 8 ? "✓" : i}</i>)}</div></div>
+          </div>
+          <div className="kernel-phase-copy"><span>{phases[phase].title}</span><strong>{phases[phase].detail}</strong></div>
+          <div className="kernel-step-controls"><button onClick={() => setPhase(Math.max(0, phase - 1))} disabled={phase === 0}>← 上一步</button><code>phase {phase + 1} / {phases.length}</code><button className="primary" onClick={() => setPhase((phase + 1) % phases.length)}>{phase === phases.length - 1 ? "重新播放 ↻" : "下一步 →"}</button></div>
+        </div>
+      </div>
+      <p className="kernel-boundary-note"><b>模拟边界：</b>展示的是源码中的逻辑 Tile、地址映射和数学阶段；实际 UB/寄存器分配、DMA 合并、Cube/Vector 映射与流水重叠由 Triton‑Ascend 编译器和硬件决定。<code>safe_exp</code> 与两个 <code>*_impl</code> 是被其他 JIT kernel 调用的内部 helper，也计入 83 个 JIT 定义。</p>
     </div>
   );
 }
@@ -510,7 +536,7 @@ export default function Home() {
             <h1>别只读代码。<br/><em>看见数据怎么跑。</em></h1>
             <p>一份从 PyTorch 到 Triton-Ascend 的中文可视化教程：亲手调 <code>grid</code>、追踪 <code>offset</code>、估算 UB，并拆开真实推理算子的每一步。</p>
             <div className="hero-actions"><a href="#transfer" className="primary">开始搬运实验 <b>→</b></a><a href="#start-checklist">先配置环境</a></div>
-            <div className="hero-meta"><span><b>4</b> 交互实验</span><span><b>14</b> 接口对照</span><span><b>4</b> 真实算子</span></div>
+            <div className="hero-meta"><span><b>5</b> 交互实验</span><span><b>14</b> 接口对照</span><span><b>{KERNEL_OPS.length}</b> Triton 模块</span></div>
           </div>
           <div className="hero-visual" aria-label="program 并行处理张量示意图">
             <div className="visual-head"><span>VECTOR_ADD.TRITON</span><i>LIVE TRACE</i></div>
@@ -583,8 +609,9 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         </section>
 
         <section id="cases" className="cases-section">
-          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>从 SGL Kernel NPU 拆 4 个真实算子。</h2><p>每个案例都给出输入、输出、grid、变量含义、PyTorch 参考和计算链；点击源码可回到仓库核对。</p></div>
+          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>把 SGL Kernel NPU 的 Triton 算子逐个跑一遍。</h2><p>覆盖当前主分支 47 个含 Triton 的 Python 模块、83 个 JIT kernel：逐步查看 Grid 如何领取 task、输入如何进入 UB、片上怎样计算，以及结果或状态如何写回。</p></div>
           <CaseSimulator />
+          <h3 className="subhead">4 个代表性算子的输入输出速查</h3>
           <div className="case-list">{CASES.map((item) => <article key={item.id}>
             <div className="case-title"><span>{item.no}</span><h3>{item.name}</h3><a href={item.source} target="_blank" rel="noreferrer">源码 ↗</a></div>
             <div className="io-flow"><div><small>INPUT</small><p>{item.input}</p></div><i>→</i><div><small>OUTPUT</small><p>{item.output}</p></div></div>
