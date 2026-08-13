@@ -341,6 +341,15 @@ function ParallelLab() {
         <label>当前循环轮次 k <b>{tick < rounds ? tick : "结束"}</b></label>
         <button className="action" onClick={() => setTick((tick + 1) % (rounds + 1))}>推进一轮 k →</button>
       </div>
+      <div className="task-scope-explainer">
+        <div className="scope-answer"><span>total_tasks 到底数什么？</span><strong>{tasks} 个逻辑工作单元</strong><p>它由 kernel 定义“一个 task 做多少工作”，<b>不是某个固定变量的 numel，也不是 X、Y、C 等所有变量 numel 的总和。</b></p></div>
+        <div className="task-examples">
+          <p><b>向量加</b><code>task = 一段 BLOCK 元素</code><span>total_tasks = ceil(N / BLOCK)</span></p>
+          <p><b>RMSNorm</b><code>task = 一行或 block_l 行</code><span>total_tasks = ceil(B×L / block_l)，C 是 task 内部元素</span></p>
+          <p><b>矩阵计算</b><code>task = 一个 [BM,BN] 输出 tile</code><span>total_tasks = ceil(M/BM) × ceil(N/BN)</span></p>
+        </div>
+        <div className="task-scope-flow"><span>完整张量 / 输出空间</span><i>按 kernel 规则切分</i><strong>{tasks} tasks</strong><i>按 pid + k×P 分配</i><strong>{cores} programs</strong></div>
+      </div>
       <div className="parallel-map">
         {assignments.map((lane, pid) => <div className="core-lane" key={pid}>
           <div className="core-label"><i />Program {pid}<small>pid={pid}</small></div>
@@ -369,8 +378,13 @@ function UbCalculator() {
   const pct = Math.min(100, kib / capacity * 100);
   return (
     <div className="lab ub-lab">
+      <div className="ub-scope-explainer">
+        <div><span>这里的 Tile 元素数</span><strong>{tile.toLocaleString()} elements</strong><p><b>一个 program 处理一个 task 的一轮中，单张工作 tile 的元素数量。</b>它不是 total_tasks、完整张量 numel、整个 grid 的搬运总数，也不是所有存活张量元素数之和。</p></div>
+        <div className="ub-scope-flow"><span>一个 NPU Core</span><i>运行一个 program</i><span>领取一个 task</span><i>当前一轮 k</i><strong>单张 tile：{tile.toLocaleString()} 元素</strong><i>UB 空间随后复用</i><span>下一个 task</span></div>
+        <p className="ub-no-multiply"><b>UB 按单个 Core 的峰值工作集估算：</b><code>{tile} × {bytes} B × {live} 张同时存活 × {buffers} 份缓冲</code>。不要再乘 <code>total_tasks</code> 或 Grid program 数；不同任务分轮处理，不会全部同时驻留在同一个 UB。</p>
+      </div>
       <div className="ub-controls">
-        <label>Tile 元素数 <input type="number" min="128" step="128" value={tile} onChange={(e) => setTile(Math.max(128, +e.target.value))} /></label>
+        <label>单张 Tile 元素数 <input type="number" min="128" step="128" value={tile} onChange={(e) => setTile(Math.max(128, +e.target.value))} /><small>例如向量 BLOCK；二维 tile 填 BM×BN</small></label>
         <label>dtype <select value={bytes} onChange={(e) => setBytes(+e.target.value)}><option value="1">int8 · 1 B</option><option value="2">fp16/bf16 · 2 B</option><option value="4">fp32 · 4 B</option></select></label>
         <label>同时存活张量 <input type="range" min="1" max="6" value={live} onChange={(e) => setLive(+e.target.value)} /><b>{live}</b></label>
         <label>缓冲份数 <select value={buffers} onChange={(e) => setBuffers(+e.target.value)}><option value="1">单缓冲 ×1</option><option value="2">双缓冲 ×2</option></select></label>
