@@ -364,7 +364,7 @@ function ParallelLab() {
 }
 
 function UbCalculator() {
-  const [tile, setTile] = useState(8192);
+  const [tile, setTile] = useState(1024);
   const [bytes, setBytes] = useState(2);
   const [live, setLive] = useState(3);
   const [buffers, setBuffers] = useState(1);
@@ -379,9 +379,54 @@ function UbCalculator() {
   return (
     <div className="lab ub-lab">
       <div className="ub-scope-explainer">
-        <div><span>这里的 Tile 元素数</span><strong>{tile.toLocaleString()} elements</strong><p><b>一个 program 处理一个 task 的一轮中，单张工作 tile 的元素数量。</b>它不是 total_tasks、完整张量 numel、整个 grid 的搬运总数，也不是所有存活张量元素数之和。</p></div>
-        <div className="ub-scope-flow"><span>一个 NPU Core</span><i>运行一个 program</i><span>领取一个 task</span><i>当前一轮 k</i><strong>单张 tile：{tile.toLocaleString()} 元素</strong><i>UB 空间随后复用</i><span>下一个 task</span></div>
-        <p className="ub-no-multiply"><b>UB 按单个 Core 的峰值工作集估算：</b><code>{tile} × {bytes} B × {live} 张同时存活 × {buffers} 份缓冲</code>。不要再乘 <code>total_tasks</code> 或 Grid program 数；不同任务分轮处理，不会全部同时驻留在同一个 UB。</p>
+        <div className="ub-definition">
+          <span>TILE 元素数</span>
+          <p><b>Tile 元素数是一个 program 处理一个 task 的一轮中，单张工作 tile 的元素数量。</b></p>
+          <strong>当前估算器：{tile.toLocaleString()} elements</strong>
+        </div>
+        <div className="ub-example-grid">
+          <article>
+            <small>逐元素算子 · 1D</small>
+            <pre><code>{`BLOCK_SIZE = 1024
+
+X_tile = 1024 个元素
+Y_tile = 1024 个元素
+C_tile = 1024 个元素
+
+tile 元素数 = 1024
+同时存活张量 = 3`}</code></pre>
+            <p><code>X</code>、<code>Y</code>、<code>C</code> 各是一张 tile；三张形状相同，所以估算器填 <b>1024</b>，再把同时存活张量设为 <b>3</b>，不是把 tile 填成 3072。</p>
+          </article>
+          <article>
+            <small>二维算子 · 2D</small>
+            <pre><code>{`BLOCK_M = 32
+BLOCK_N = 64
+
+tile 元素数
+= BLOCK_M × BLOCK_N
+= 32 × 64
+= 2048`}</code></pre>
+            <p>二维 tile 先按两个轴相乘。这里一张 tile 覆盖 <b>32 行 × 64 列</b>，所以单张 tile 是 <b>2048</b> 个元素。</p>
+          </article>
+          <article>
+            <small>归约算子 · Reduction</small>
+            <pre><code>{`BLOCK_L = 4
+C = 4096
+
+X_tile 元素数
+= BLOCK_L × C
+= 4 × 4096
+= 16384`}</code></pre>
+            <p>归约输入 <code>X_tile</code> 同时覆盖 <b>4 行 × 4096 个归约列</b>。若输出或临时量的 tile 形状不同，应分别计算后相加，不能都套用 16384。</p>
+          </article>
+        </div>
+        <div className="ub-round-cycle">
+          <div><span>每个 program 每轮只处理一个 task</span><strong>第 k 轮</strong></div>
+          <ol>
+            <li>取一个 task</li><li>搬入这个 task 的 tile</li><li>在 UB 计算</li><li>写回</li><li>UB 空间复用</li><li>进入下一轮</li>
+          </ol>
+        </div>
+        <p className="ub-no-multiply"><b>当前快捷估算（假设 {live} 张存活张量的 tile 大小相同）：</b><code>{tile} × {bytes} B × {live} 张同时存活 × {buffers} 份缓冲</code>。不要再乘 <code>total_tasks</code> 或 Grid program 数；task 分轮进入同一个 UB。若各张量 tile 大小不同，应改为逐张计算 <code>Σ align32(tileᵢ × dtypeᵢ)</code>。</p>
       </div>
       <div className="ub-controls">
         <label>单张 Tile 元素数 <input type="number" min="128" step="128" value={tile} onChange={(e) => setTile(Math.max(128, +e.target.value))} /><small>例如向量 BLOCK；二维 tile 填 BM×BN</small></label>
