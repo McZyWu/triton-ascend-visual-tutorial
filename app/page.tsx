@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
 
 const SOURCE = {
   quick: "https://github.com/triton-lang/triton-ascend/blob/main/docs/en/quick_start.md",
@@ -131,54 +132,165 @@ function CodeBlock({ children, label = "python" }: { children: string; label?: s
 }
 
 function TransferLab() {
-  const [n, setN] = useState(19);
-  const [block, setBlock] = useState(8);
-  const [pid, setPid] = useState(1);
+  const [dims, setDims] = useState<1 | 2 | 3>(2);
+  const [shape, setShape] = useState<[number, number, number]>([3, 7, 10]);
+  const [block, setBlock] = useState<[number, number, number]>([2, 3, 4]);
+  const [pid, setPid] = useState<[number, number, number]>([0, 1, 1]);
   const [phase, setPhase] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const grid = Math.ceil(n / block);
-  const safePid = Math.min(pid, Math.max(0, grid - 1));
-  const offsets = Array.from({ length: block }, (_, i) => safePid * block + i);
-  const valid = offsets.map((x) => x < n);
-  const phases = ["定位 program", "GM → UB：load x, y", "UB：x + y", "UB → GM：store output"];
+  const activeShape: [number, number, number] = [dims === 3 ? shape[0] : 1, dims >= 2 ? shape[1] : 1, shape[2]];
+  const activeBlock: [number, number, number] = [dims === 3 ? block[0] : 1, dims >= 2 ? block[1] : 1, block[2]];
+  const grid: [number, number, number] = activeShape.map((size, axis) => Math.ceil(size / activeBlock[axis])) as [number, number, number];
+  const safePid: [number, number, number] = pid.map((value, axis) => Math.min(value, Math.max(0, grid[axis] - 1))) as [number, number, number];
+  const starts: [number, number, number] = safePid.map((value, axis) => value * activeBlock[axis]) as [number, number, number];
+  const lanes = useMemo(() => {
+    const result: Array<{ local: [number, number, number]; global: [number, number, number]; offset: number; valid: boolean; x: number; y: number; sum: number }> = [];
+    for (let lz = 0; lz < activeBlock[0]; lz++) {
+      for (let ly = 0; ly < activeBlock[1]; ly++) {
+        for (let lx = 0; lx < activeBlock[2]; lx++) {
+          const global: [number, number, number] = [starts[0] + lz, starts[1] + ly, starts[2] + lx];
+          const valid = global[0] < activeShape[0] && global[1] < activeShape[1] && global[2] < activeShape[2];
+          const offset = (global[0] * activeShape[1] + global[1]) * activeShape[2] + global[2];
+          const x = offset + 1;
+          const y = (offset + 1) * 10;
+          result.push({ local: [lz, ly, lx], global, offset, valid, x, y, sum: x + y });
+        }
+      }
+    }
+    return result;
+  }, [activeBlock[0], activeBlock[1], activeBlock[2], activeShape[0], activeShape[1], activeShape[2], starts[0], starts[1], starts[2]]);
+  const phases = ["选择 grid 中的 program", "生成多维坐标、展平 offset 与 mask", "X、Y 分别从 GM 搬入 UB", "UB 中逐 lane 计算 X + Y", "把结果 C 从 UB 写回 GM"];
   useEffect(() => {
     if (!playing) return;
     const timer = window.setInterval(() => setPhase((p) => {
-      if (p === 3) { setPlaying(false); return 3; }
+      if (p === 4) { setPlaying(false); return 4; }
       return p + 1;
     }), 900);
     return () => window.clearInterval(timer);
   }, [playing]);
-  useEffect(() => { setPid((p) => Math.min(p, Math.max(0, grid - 1))); setPhase(0); }, [grid]);
+  useEffect(() => {
+    setPid((current) => current.map((value, axis) => Math.min(value, Math.max(0, grid[axis] - 1))) as [number, number, number]);
+    setPhase(0);
+  }, [dims, grid[0], grid[1], grid[2]]);
+
+  const setAxis = (setter: typeof setShape | typeof setBlock | typeof setPid, values: [number, number, number], axis: number, value: number) => {
+    const next = [...values] as [number, number, number];
+    next[axis] = value;
+    setter(next);
+    setPlaying(false);
+    setPhase(0);
+  };
+  const coordText = (coord: [number, number, number]) => dims === 1 ? `[${coord[2]}]` : dims === 2 ? `[${coord[1]},${coord[2]}]` : `[${coord.join(",")}]`;
+  const programText = (coord: [number, number, number]) => dims === 1 ? `(${coord[2]})` : dims === 2 ? `(${coord[2]},${coord[1]})` : `(${coord[2]},${coord[1]},${coord[0]})`;
+  const blockTuple = dims === 1 ? `(${activeBlock[2]})` : dims === 2 ? `(${activeBlock[1]}, ${activeBlock[2]})` : `(${activeBlock.join(", ")})`;
+  const gridTuple = dims === 1 ? `(${grid[2]},)` : dims === 2 ? `(${grid[2]}, ${grid[1]})` : `(${grid[2]}, ${grid[1]}, ${grid[0]})`;
+  const pidTuple = dims === 1 ? `(${safePid[2]})` : dims === 2 ? `(${safePid[2]}, ${safePid[1]})` : `(${safePid[2]}, ${safePid[1]}, ${safePid[0]})`;
+  const offsetFormula = dims === 1
+    ? `x = pidₓ×Bₓ+laneₓ；offset = x`
+    : dims === 2
+      ? `y = pidᵧ×Bᵧ+laneᵧ；x = pidₓ×Bₓ+laneₓ；offset = y×W+x`
+      : `z/y/x = pid×BLOCK+lane；offset = (z×H+y)×W+x`;
+
+  const programPlanes = Array.from({ length: grid[0] }, (_, pz) => (
+    <div className="program-plane" key={pz}>
+      {dims === 3 && <small>grid z = {pz}</small>}
+      <div className="program-grid" style={{ gridTemplateColumns: `repeat(${grid[2]}, minmax(40px, 1fr))` }}>
+        {Array.from({ length: grid[1] }, (_, py) => Array.from({ length: grid[2] }, (_, px) => {
+          const selected = safePid[0] === pz && safePid[1] === py && safePid[2] === px;
+          const start = [pz * activeBlock[0], py * activeBlock[1], px * activeBlock[2]] as [number, number, number];
+          return <button key={`${pz}-${py}-${px}`} className={selected ? "selected" : ""} onClick={() => { setPid([pz, py, px]); setPhase(0); setPlaying(false); }} aria-pressed={selected}>
+            <b>pid {programText([pz, py, px])}</b><span>start {coordText(start)}</span>
+          </button>;
+        }))}
+      </div>
+    </div>
+  ));
+
+  const valueLayer = (name: string, stage: string, getter: (lane: typeof lanes[number]) => string | number, visible: boolean, accent: string) => (
+    <div className={`value-layer ${visible ? "visible" : "waiting"}`}>
+      <div className="value-layer-head"><b>{name}</b><span>{stage}</span></div>
+      <div className="tile-slices">
+        {Array.from({ length: activeBlock[0] }, (_, lz) => <div className="tile-slice" key={lz}>
+          {dims === 3 && <small>local z={lz} → global z={starts[0] + lz}</small>}
+          <div className="value-grid" style={{ gridTemplateColumns: `repeat(${activeBlock[2]}, minmax(44px, 1fr))`, "--layer-accent": accent } as CSSProperties}>
+            {lanes.filter((lane) => lane.local[0] === lz).map((lane) => <div key={`${name}-${lane.local.join("-")}`} className={lane.valid ? "valid" : "masked"}>
+              <i>{lane.valid && visible ? getter(lane) : lane.valid ? "·" : "MASK"}</i>
+              <span>{coordText(lane.global)}</span>
+            </div>)}
+          </div>
+        </div>)}
+      </div>
+    </div>
+  );
 
   return (
     <div className="lab transfer-lab">
+      <div className="dimension-tabs" aria-label="选择张量与 grid 维度">
+        <span>DIMENSION</span>
+        {([1, 2, 3] as const).map((value) => <button key={value} className={dims === value ? "active" : ""} onClick={() => { setDims(value); setPhase(0); setPlaying(false); }}>{value}D</button>)}
+        <p>{dims === 1 ? "向量：一个 program 搬一段连续元素" : dims === 2 ? "矩阵：program (pidᵧ,pidₓ) 搬一个二维 tile" : "体张量：program (pid_z,pidᵧ,pidₓ) 搬一个三维 block"}</p>
+      </div>
       <div className="lab-toolbar">
-        <label>N 元素 <input type="range" min="9" max="32" value={n} onChange={(e) => setN(+e.target.value)} /><b>{n}</b></label>
-        <label>BLOCK_SIZE <select value={block} onChange={(e) => setBlock(+e.target.value)}><option>4</option><option>8</option><option>16</option></select></label>
-        <label>program_id <input type="range" min="0" max={Math.max(0, grid - 1)} value={safePid} onChange={(e) => { setPid(+e.target.value); setPhase(0); }} /><b>{safePid}</b></label>
+        <div className="control-group"><span>SHAPE</span>
+          {dims === 3 && <label>D/Z <input type="range" min="2" max="4" value={shape[0]} onChange={(e) => setAxis(setShape, shape, 0, +e.target.value)} /><b>{shape[0]}</b></label>}
+          {dims >= 2 && <label>H/Y <input type="range" min="4" max="9" value={shape[1]} onChange={(e) => setAxis(setShape, shape, 1, +e.target.value)} /><b>{shape[1]}</b></label>}
+          <label>{dims === 1 ? "N/X" : "W/X"} <input type="range" min={dims === 1 ? 9 : 5} max={dims === 1 ? 32 : 12} value={shape[2]} onChange={(e) => setAxis(setShape, shape, 2, +e.target.value)} /><b>{shape[2]}</b></label>
+        </div>
+        <div className="control-group"><span>BLOCK_SIZE</span>
+          {dims === 3 && <label>Bz <select value={block[0]} onChange={(e) => setAxis(setBlock, block, 0, +e.target.value)}><option>1</option><option>2</option></select></label>}
+          {dims >= 2 && <label>By <select value={block[1]} onChange={(e) => setAxis(setBlock, block, 1, +e.target.value)}><option>2</option><option>3</option><option>4</option></select></label>}
+          <label>Bx <select value={block[2]} onChange={(e) => setAxis(setBlock, block, 2, +e.target.value)}>{(dims === 1 ? [4, 8, 16] : [2, 3, 4]).map((value) => <option key={value}>{value}</option>)}</select></label>
+        </div>
+        <div className="control-group"><span>PROGRAM_ID</span>
+          {dims === 3 && <label>pid_z <input type="range" min="0" max={grid[0] - 1} value={safePid[0]} onChange={(e) => setAxis(setPid, safePid, 0, +e.target.value)} /><b>{safePid[0]}</b></label>}
+          {dims >= 2 && <label>pid_y <input type="range" min="0" max={grid[1] - 1} value={safePid[1]} onChange={(e) => setAxis(setPid, safePid, 1, +e.target.value)} /><b>{safePid[1]}</b></label>}
+          <label>pid_x <input type="range" min="0" max={grid[2] - 1} value={safePid[2]} onChange={(e) => setAxis(setPid, safePid, 2, +e.target.value)} /><b>{safePid[2]}</b></label>
+        </div>
+        <div className="transport-actions">
         <button className="action" onClick={() => { setPhase(0); setPlaying(true); }}>{playing ? "搬运中…" : "▶ 播放搬运"}</button>
-        <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 4); }}>单步 →</button>
+        <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 5); }}>单步 →</button>
+        </div>
       </div>
       <div className="equation-strip">
-        <span>grid = ceil({n}/{block}) = <strong>{grid}</strong></span>
-        <span>block_start = {safePid}×{block} = <strong>{safePid * block}</strong></span>
-        <span>有效 lane = <strong>{valid.filter(Boolean).length}/{block}</strong></span>
+        <span>shape = <strong>{dims === 1 ? `[${shape[2]}]` : dims === 2 ? `[${shape[1]}, ${shape[2]}]` : `[${shape.join(", ")}]`}</strong></span>
+        <span>BLOCK = <strong>{blockTuple}</strong></span>
+        <span>grid = cdiv(shape, block) = <strong>{gridTuple}</strong></span>
+        <span>pid = <strong>{pidTuple}</strong></span>
+        <span>block_start = <strong>{coordText(starts)}</strong></span>
+        <span>有效 lanes = <strong>{lanes.filter((lane) => lane.valid).length}/{lanes.length}</strong></span>
       </div>
-      <div className="memory-stage" aria-label="全局内存到统一缓冲区的搬运模拟">
-        <div className={`memory-zone gm ${phase === 1 || phase === 3 ? "active" : ""}`}>
-          <div className="zone-title"><span>GM / HBM</span><small>大容量 · 高延迟</small></div>
-          <div className="tensor-row">{Array.from({ length: n }, (_, i) => <i key={i} className={offsets.includes(i) && phase <= 1 ? "selected" : ""}>{i}</i>)}</div>
+      <div className="multidim-formula">
+        <b>地址展开</b><code>{offsetFormula}</code><span>grid tuple 按 Triton 轴写作 x→axis 0、y→axis 1、z→axis 2；内存仍按最后一维 X 连续。</span>
+      </div>
+      <div className={`program-selector ${phase === 0 ? "active" : ""}`}>
+        <div className="zone-title"><span>GRID / PROGRAM MAP</span><small>点击任一 program，观察它负责的 block</small></div>
+        {programPlanes}
+      </div>
+      <div className="coordinate-ledger">
+        <div className="zone-title"><span>LANE → GLOBAL COORD → FLAT OFFSET</span><small>mask 在每一个维度分别判断越界</small></div>
+        <div className="coordinate-table"><div><b>local lane</b><b>global coord</b><b>flat offset</b><b>mask</b></div>{lanes.map((lane) => <div key={`coord-${lane.local.join("-")}`} className={lane.valid ? "" : "masked"}><code>{coordText(lane.local)}</code><code>{coordText(lane.global)}</code><code>{lane.offset}</code><strong>{lane.valid ? "TRUE" : "FALSE"}</strong></div>)}</div>
+      </div>
+      <div className="memory-stage-v2" aria-label={`${dims}维 X 和 Y 从全局内存搬到统一缓冲区、相加并写回 C 的模拟`}>
+        <div className={`memory-column gm ${phase === 2 ? "active" : ""}`}>
+          <div className="zone-title"><span>GM / SOURCE</span><small>两个独立输入张量</small></div>
+          {valueLayer("X", `global ${dims}D tensor`, (lane) => lane.x, true, "var(--cyan)")}
+          {valueLayer("Y", `global ${dims}D tensor`, (lane) => lane.y, true, "var(--orange)")}
         </div>
-        <div className={`bus ${phase === 1 ? "to-ub" : phase === 3 ? "to-gm" : ""}`}><span>{phase === 3 ? "STORE" : "LOAD"}</span><i /></div>
-        <div className={`memory-zone ub ${phase === 2 ? "active" : ""}`}>
-          <div className="zone-title"><span>UB / 片上工作集</span><small>当前 program 私有视图</small></div>
-          <div className="lane-grid">
-            {offsets.map((off, i) => <div key={i} className={`lane ${valid[i] ? "valid" : "masked"} ${phase === 2 ? "computing" : ""}`}><b>L{i}</b><span>off {off}</span><em>{valid[i] ? (phase >= 2 ? `${off}+${off + 1}=${off * 2 + 1}` : `x[${off}], y[${off}]`) : "MASK"}</em></div>)}
-          </div>
+        <div className={`bus-v2 ${phase === 2 ? "active load" : ""}`}><span>LOAD X</span><span>LOAD Y</span><i /></div>
+        <div className={`memory-column ub ${phase === 2 || phase === 3 ? "active" : ""}`}>
+          <div className="zone-title"><span>UB / CURRENT BLOCK</span><small>{blockTuple} lanes</small></div>
+          {valueLayer("X_tile", "tl.load(x_ptr + offsets)", (lane) => lane.x, phase >= 2, "var(--cyan)")}
+          {valueLayer("Y_tile", "tl.load(y_ptr + offsets)", (lane) => lane.y, phase >= 2, "var(--orange)")}
+          <div className="alu-sign"><span>X_tile</span><b>+</b><span>Y_tile</span><i>逐 lane 并行</i></div>
+          {valueLayer("C_tile = X + Y", "UB compute result", (lane) => lane.sum, phase >= 3, "var(--acid)")}
+        </div>
+        <div className={`bus-v2 store ${phase === 4 ? "active" : ""}`}><span>STORE C</span><i /></div>
+        <div className={`memory-column output ${phase === 4 ? "active" : ""}`}>
+          <div className="zone-title"><span>GM / OUTPUT C</span><small>只写 mask=true 的位置</small></div>
+          {valueLayer("C", `output shape ${dims}D`, (lane) => lane.sum, phase >= 4, "var(--acid)")}
         </div>
       </div>
-      <div className="step-line"><b>STEP {phase + 1}/4</b><span>{phases[phase]}</span><code>{phase === 0 ? `offsets = ${safePid * block} + arange(0, ${block})` : phase === 1 ? "tl.load(ptr + offsets, mask=offsets < N)" : phase === 2 ? "result = x + y  # 各 lane 同时" : "tl.store(output_ptr + offsets, result, mask)"}</code></div>
+      <div className="step-line"><b>STEP {phase + 1}/5</b><span>{phases[phase]}</span><code>{phase === 0 ? `pid = ${pidTuple} in grid ${gridTuple}` : phase === 1 ? offsetFormula : phase === 2 ? "x = tl.load(x_ptr + offsets, mask); y = tl.load(y_ptr + offsets, mask)" : phase === 3 ? "c = x + y  # X、Y、C 三组数值分开显示" : "tl.store(c_ptr + offsets, c, mask=mask)"}</code></div>
     </div>
   );
 }

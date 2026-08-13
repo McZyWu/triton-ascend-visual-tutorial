@@ -3,7 +3,8 @@
 一个中文交互式教程，覆盖 Triton-Ascend 官方 Quick Start，并扩展到：
 
 - `program_id / grid / offset / mask` 的逐槽位可视化
-- GM → UB → 计算 → GM 的搬运模拟
+- 1D / 2D / 3D Grid、各轴 BLOCK_SIZE 与 GM → UB → 计算 → GM 的搬运模拟
+- 独立展示 X、Y、UB 中间值、X+Y 和输出 C，以及多维坐标到 flat offset 的展开
 - persistent grid 并行任务分配
 - UB 峰值工作集估算器与溢出排查
 - 来自 `sgl-project/sgl-kernel-npu` 的 RMSNorm、SwiGLU、融合 Argmax+Softmax、KV cache 写入案例
