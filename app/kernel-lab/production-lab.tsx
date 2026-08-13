@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { KERNEL_GROUPS, KERNEL_OPS, type KernelOp, TOTAL_TRITON_KERNELS } from "../kernel-ops";
 import { KERNEL_SIGNATURES } from "../kernel-signatures";
+import { KERNEL_CALL_BINDINGS } from "../kernel-call-bindings";
 
 type ArgKind = "input" | "output" | "inout" | "index" | "stride" | "shape" | "block" | "flag" | "scalar" | "helper";
 type Coord = { lane: number; local: number[]; global: number[]; flat: number; valid: boolean };
@@ -16,6 +17,60 @@ const STEPS = [
 ] as const;
 
 const SOURCE_ROOT = "https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/sgl_kernel_npu";
+const SGLANG_ROOT = "https://github.com/sgl-project/sglang/blob/main/python/sglang";
+
+type ArgMeaning = { meaning: string; shape: string; caller: string };
+
+const EXACT_ARG_MEANINGS: Record<string, Partial<ArgMeaning>> = {
+  hidden_states: { meaning:"MLP/GEMM 产生的 gate-up 融合 hidden states", shape:"[tokens, 2 × intermediate_size]", caller:"模型 MLP 激活输入" },
+  hidden_states_ptr: { meaning:"当前 token 的模型 hidden states", shape:"[tokens, hidden_size]", caller:"MoE 路由前的 hidden_states" },
+  hidden_state_ptr: { meaning:"当前 token / draft step 的 hidden state", shape:"[batch, hidden_size] 或 [batch, hidden_size, steps]", caller:"模型层传入的 hidden_states" },
+  input1_ptr: { meaning:"已路由专家分支的 hidden states", shape:"[tokens, hidden_size]", caller:"routed_input" },
+  input2_ptr: { meaning:"共享专家或残差分支的 hidden states", shape:"[tokens, hidden_size]", caller:"shared_input" },
+  input_ptr: { meaning:"该算子的主输入张量；具体内容见当前算子标题与上方输入说明", shape:"由 wrapper 展平为 [rows, feature]，或保持源码声明的多维布局", caller:"Python wrapper 的 input / x / fused projection 输出" },
+  x_ptr: { meaning:"算子的主输入 x；在激活/归一化中通常就是 hidden states", shape:"通常 [tokens, hidden_size]；门控激活时为 [tokens, 2 × intermediate_size]", caller:"wrapper 的 x 或 hidden_states" },
+  q_ptr: { meaning:"Query 张量", shape:"[batch 或 tokens, q_heads, head_dim]（部分 kernel 展平末两维）", caller:"注意力层由 q_proj / 融合 QKV 投影得到的 q" },
+  Q: { meaning:"decode 当前步的 Query", shape:"[batch, q_heads, qk_head_dim]", caller:"注意力后端传给 decode_gqa / decode_mla 的 q" },
+  query: { meaning:"注意力 Query", shape:"[tokens, q_heads, head_dim]", caller:"模型 attention 的 query states" },
+  query_ptr: { meaning:"注意力或索引器使用的 Query", shape:"[batch/tokens, heads, head_dim]", caller:"attention/indexer 后端的 query states" },
+  k_ptr: { meaning:"Key 输出或工作张量", shape:"[batch 或 tokens, kv_heads, head_dim]", caller:"融合 QKV 输入拆出的 k；随后写入或读取 KV cache" },
+  v_ptr: { meaning:"Value 输出或工作张量", shape:"[batch 或 tokens, kv_heads, value_dim]", caller:"融合 QKV 输入拆出的 v；随后写入或读取 KV cache" },
+  K_Buffer: { meaning:"分页 Key cache", shape:"[num_pages, page_size, kv_heads, key_dim]", caller:"请求 KV cache pool 中的 k_buffer" },
+  V_Buffer: { meaning:"分页 Value cache", shape:"[num_pages, page_size, kv_heads, value_dim]", caller:"请求 KV cache pool 中的 v_buffer" },
+  K_NOPE_Buffer: { meaning:"MLA 中不含 RoPE 部分的分页 Key cache", shape:"[num_pages, page_size, kv_heads, kv_lora_rank]", caller:"MLA KV cache 的 compressed/nope 部分" },
+  K_ROPE_Buffer: { meaning:"MLA 中携带位置编码的 Key cache", shape:"[num_pages, page_size, kv_heads, rope_dim]", caller:"MLA KV cache 的 RoPE 部分" },
+  k_cache: { meaning:"分页 Key cache", shape:"[num_pages, page_size, kv_heads, head_dim]", caller:"请求 KV cache pool" },
+  v_cache: { meaning:"分页 Value cache", shape:"[num_pages, page_size, kv_heads, head_dim]", caller:"请求 KV cache pool" },
+  k_cache_ptr: { meaning:"分页 Key cache", shape:"[num_pages, page_size, kv_heads, head_dim]", caller:"请求 KV cache pool" },
+  v_cache_ptr: { meaning:"分页 Value cache", shape:"[num_pages, page_size, kv_heads, head_dim]", caller:"请求 KV cache pool" },
+  Att_Out: { meaning:"decode attention 的输出", shape:"[batch, q_heads, value_dim]", caller:"attention 后端预分配的 att_out" },
+  attn_out: { meaning:"attention 输出 hidden states", shape:"[tokens, q_heads, value_dim]", caller:"注意力层输出缓冲区" },
+  block_table: { meaning:"逻辑 KV page 到物理 cache page 的映射表", shape:"[batch, max_num_pages]", caller:"调度器为每个请求维护的 block table" },
+  block_tables: { meaning:"逻辑 KV page 到物理 cache page 的映射表", shape:"[batch, max_num_pages]", caller:"调度器为每个请求维护的 block tables" },
+  block_table_ptr: { meaning:"逻辑 KV page 到物理 cache page 的映射表", shape:"[batch, max_num_pages]", caller:"注意力后端生成的 block_table" },
+  kv_seq_lens: { meaning:"每个请求当前可见的 KV token 数", shape:"[batch]", caller:"forward batch 的序列长度元数据" },
+  seq_lens: { meaning:"每个请求的实际序列长度", shape:"[batch]", caller:"forward batch / scheduler 的 seq_lens" },
+  seq_lens_ptr: { meaning:"每个请求的实际序列长度", shape:"[batch]", caller:"forward batch / scheduler 的 seq_lens" },
+  req_to_token_ptr: { meaning:"request slot 与逻辑 token 位置到物理 token/cache slot 的映射", shape:"[request_pool_size, max_context_len]", caller:"req_to_token_pool.req_to_token" },
+  req_pool_indices_ptr: { meaning:"batch 中每个请求对应的 request-pool slot", shape:"[batch]", caller:"forward_batch.req_pool_indices" },
+  group_list_ptr: { meaning:"各 expert 的 token 分组边界或计数", shape:"[num_experts] 或 [num_experts + 1]", caller:"MoE dispatch 产生的 group_list" },
+  weight_ptr: { meaning:"逐 hidden/channel 使用的模型权重", shape:"[hidden_size]；卷积权重另见当前 wrapper", caller:"模块参数 weight" },
+  bias_ptr: { meaning:"逐 hidden/channel 广播的偏置", shape:"[hidden_size]", caller:"模块参数 bias" },
+  residual_ptr: { meaning:"与主分支相加的残差 hidden states", shape:"[tokens, hidden_size]", caller:"Transformer block 的 residual" },
+  output_ptr: { meaning:"当前算子的输出张量", shape:"通常与主输入同 shape；降维/拆分算子按上方输出说明", caller:"Python wrapper 预分配的 output" },
+  out_ptr: { meaning:"当前算子的输出或量化输出", shape:"由 wrapper 根据算子语义分配；通常 [tokens, output_hidden]", caller:"Python wrapper 的 out" },
+  scale_ptr: { meaning:"量化或归一化产生/使用的 scale", shape:"常见 [tokens]、[groups] 或 [hidden_size]", caller:"量化元数据或模型 scale 参数" },
+  logits_ptr: { meaning:"采样前的词表 logits", shape:"[batch, vocab_size]", caller:"LM head 输出 logits" },
+  argmax_ptr: { meaning:"每个请求最大 logit 对应的 token id", shape:"[batch]", caller:"采样器输出 token ids" },
+  prob_ptr: { meaning:"被选中 argmax token 的 softmax 概率", shape:"[batch]", caller:"采样器输出概率" },
+  conv_state_ptr: { meaning:"Mamba/线性注意力的卷积历史缓存", shape:"[num_cache_lines, channels, state_len]", caller:"mamba cache pool 的 conv_state" },
+  conv_states_ptr: { meaning:"Mamba/线性注意力的卷积历史缓存", shape:"[num_cache_lines, channels, state_len]", caller:"mamba cache pool 的 conv states" },
+  conv_state_indices_ptr: { meaning:"当前 batch 每个请求选择的卷积 cache line", shape:"[batch]", caller:"forward metadata 的 mamba_cache_indices" },
+  pos_ptr: { meaning:"每个 token/row 的绝对 position id", shape:"[tokens]", caller:"模型 forward 的 positions" },
+  sin_ptr: { meaning:"当前 position 对应的 RoPE sin", shape:"[tokens, rope_dim] 或可广播 cache", caller:"rotary embedding 生成的 position_sin" },
+  cos_ptr: { meaning:"当前 position 对应的 RoPE cos", shape:"[tokens, rope_dim] 或可广播 cache", caller:"rotary embedding 生成的 position_cos" },
+  cos_sin_cache_ptr: { meaning:"按 position 索引的半宽 RoPE cos/sin cache", shape:"[max_seq_len, rope_dim]", caller:"rotary embedding 的全局 position cache" },
+};
 
 function outputArg(name: string) {
   const n = name.toLowerCase();
@@ -54,19 +109,46 @@ const KIND_TEXT: Record<ArgKind, string> = {
   shape: "形状 / 循环边界", block: "编译期 Block", flag: "编译期分支", scalar: "标量参数", helper: "编译器 helper",
 };
 
-function explainArg(name: string, kind: ArgKind) {
+function shapeFromName(name: string, kind: ArgKind, op: KernelOp): string {
   const n = name.toLowerCase();
-  if (kind === "stride") return `${name} 个元素跨到下一维；地址公式中与对应坐标相乘，不是字节数。`;
-  if (kind === "block") return `${name} 决定一个 program 当前 tile 的覆盖范围，也影响 lane、mask 与 UB 占用。`;
-  if (kind === "flag") return `${name} 在编译期选择代码分支；关闭时相关 load / compute / store 会被消除。`;
-  if (kind === "shape") return `${name} 是真实边界或循环次数；lane 坐标与它比较生成 mask。`;
-  if (kind === "index") return `${name} 先从 GM 读取索引，再把逻辑 task / page 映射到第二个物理地址。`;
-  if (kind === "output") return `${name} 接收当前 program 的有效 lane；store 使用与输出布局对应的 stride 和 mask。`;
-  if (kind === "inout") return `${name} 先从 GM load 到片上，计算后再写回同一张量或状态缓存。`;
-  if (kind === "input") return `${name} 的基址不等于元素地址；要加上 program 坐标、lane 坐标和 stride 的组合。`;
-  if (/scale|alpha|beta/.test(n)) return `${name} 是计算中的缩放系数，load 后通常转成计算精度再广播到 tile。`;
-  if (/eps/.test(n)) return `${name} 防止归一化分母为零，通常加在 variance / norm 内。`;
-  return `${name} 是 kernel 的运行时标量或编译期常量，参与地址、边界或数学表达式。`;
+  if (kind === "stride" || kind === "shape" || kind === "block" || kind === "flag" || kind === "scalar" || kind === "helper") return "标量";
+  if (/qk_var/.test(n)) return "[tokens, 2]（Q/K 各一个方差）";
+  if (/mean|rstd|variance/.test(n)) return "[rows] 或 [rows, 1]";
+  if (/scale|offset/.test(n) && !/state|stride/.test(n)) return "[rows]、[groups] 或可广播 shape";
+  if (/expert_(indices|scales)|topk_(idx|indices)|candidate_(indices|scores)/.test(n)) return "[tokens, top_k]";
+  if (/accept_index/.test(n)) return "[batch, num_draft_tokens]";
+  if (/accept_token_num/.test(n)) return "[batch]";
+  if (/predict|candidate|retrive/.test(n)) return "[batch, num_draft_tokens] 或展平后的等价布局";
+  if (/state|snapshot|cache/.test(n)) return op.group === "Mamba / Cache" ? "[cache_slots, layers/heads, hidden/channel, state/window]（以 wrapper stride 为准）" : "缓存布局；维度由当前 wrapper 的 stride 参数给出";
+  if (/weight|bias/.test(n)) return "[hidden/head/channel dim]，按对应维广播";
+  if (/^(q|k|v|o|g|w|h|h0|ht|a|b|beta)$/.test(n)) return "源码采用的多维工作张量；维度符号见本 kernel 的 shape 参数";
+  return "见 Python wrapper 的实参 shape；kernel 可能把它展平后寻址";
+}
+
+function meaningFromName(name: string, kind: ArgKind, op: KernelOp, callerExpression?: string, wrapper?: string, wrapperShape?: string): ArgMeaning {
+  const exact = EXACT_ARG_MEANINGS[name];
+  const n = name.toLowerCase();
+  let meaning = exact?.meaning;
+  if (!meaning) {
+    if (kind === "stride") meaning = `${name.replace(/^stride_/, "").replace(/_stride$/, "")} 这一维跨一格对应的元素步长（不是字节数）`;
+    else if (kind === "block") meaning = `当前 program 在 ${name.replace(/^block(_size)?_?/i, "")} 维上的编译期 tile 大小`;
+    else if (kind === "flag") meaning = `控制 ${name.replace(/_/g, " ").toLowerCase()} 代码路径是否启用的编译期条件`;
+    else if (kind === "shape") meaning = `${name.replace(/_/g, " ").toLowerCase()} 的真实尺寸、数量或循环边界`;
+    else if (kind === "index") meaning = /len|seqlen/.test(n) ? "每个 request / sequence 的有效长度" : /table/.test(n) ? "逻辑位置到物理 cache/page 的映射表" : "选择 request、token、page、expert 或 cache slot 的整数索引";
+    else if (/weight/.test(n)) meaning = "该算子使用的模型权重";
+    else if (/bias/.test(n)) meaning = "该算子使用的广播偏置";
+    else if (/scale|alpha|beta/.test(n)) meaning = "计算、attention 或量化使用的缩放系数";
+    else if (/eps|epsilon/.test(n)) meaning = "归一化数值稳定项，加入 variance / norm 后避免除零";
+    else if (kind === "output") meaning = "Python wrapper 为当前算子分配的结果张量";
+    else if (kind === "inout") meaning = "既提供旧值又接收更新值的状态或缓存张量";
+    else if (kind === "input") meaning = `当前 ${op.title} 的输入/中间张量；名字 ${name} 与 wrapper 调用位置一一对应`;
+    else meaning = `参与 ${op.title} 地址计算、边界判断或数学公式的标量`;
+  }
+  return {
+    meaning,
+    shape: wrapperShape ?? exact?.shape ?? shapeFromName(name, kind, op),
+    caller: callerExpression ? `${wrapper ?? "Python wrapper"} 中传入 ${callerExpression}` : exact?.caller ?? (kind === "block" || kind === "flag" ? "Python wrapper 启动 kernel 时传入的 constexpr" : kind === "stride" || kind === "shape" ? "由实参 tensor.shape / stride 推导后传入" : kind === "scalar" ? "模型配置、算子参数或 wrapper 计算值" : `sgl-kernel-npu 的 ${op.module} Python wrapper；上层模型语义见本算子输入说明`),
+  };
 }
 
 function profileFor(op: KernelOp) {
@@ -133,6 +215,7 @@ function KernelProductionLab() {
   const [variable, setVariable] = useState("");
   const kernel = selected.kernels[Math.min(kernelIndex, selected.kernels.length - 1)];
   const signature = KERNEL_SIGNATURES[selected.module]?.[kernel];
+  const callBinding = KERNEL_CALL_BINDINGS[selected.module]?.[kernel];
   const args = useMemo(() => signature?.args ?? [], [signature]);
   const profile = profileFor(selected);
 
@@ -142,7 +225,10 @@ function KernelProductionLab() {
     return () => window.clearInterval(timer);
   }, [playing]);
 
-  const argRows = useMemo(() => args.map(name => ({ name, kind: classifyArg(name, signature?.loads, signature?.stores), loaded:(signature?.loads.includes(name) ?? false) && pointerArg(name), stored:(signature?.stores.includes(name) ?? false) && pointerArg(name) })), [args, signature]);
+  const argRows = args.map(name => {
+    const kind = classifyArg(name, signature?.loads, signature?.stores);
+    return { name, kind, ...meaningFromName(name, kind, selected, callBinding?.args[name], callBinding?.wrapper, callBinding?.shapes[name]), loaded:(signature?.loads.includes(name) ?? false) && pointerArg(name), stored:(signature?.stores.includes(name) ?? false) && pointerArg(name) };
+  });
   const pointerRows = argRows.filter(x => ["input","output","inout","index"].includes(x.kind));
   const inputs = pointerRows.filter(x => x.kind !== "output");
   const outputs = pointerRows.filter(x => x.kind === "output" || x.kind === "inout");
@@ -181,7 +267,7 @@ function KernelProductionLab() {
     return { flat, p:[Math.floor(flat/(grid[1]*grid[2])), Math.floor(flat/grid[2])%grid[1], flat%grid[2]] };
   });
 
-  return <main className="production-lab-page">
+  return <main className="production-lab-page variable-semantics-v2">
     <header className="pl-topbar">
       <Link href="/#cases">← 返回教程</Link>
       <div><b>Triton Ascend · Production Kernel Lab</b><span>{KERNEL_OPS.length} modules / {TOTAL_TRITON_KERNELS} JIT kernels</span></div>
@@ -234,9 +320,9 @@ function KernelProductionLab() {
       </section>
 
       <section className={`pl-variable-panel ${step === 3 || step === 6 ? "focus" : ""}`}>
-        <header><div><span>ALL KERNEL ARGUMENTS</span><h2>每个变量在 load / compute / store 中的作用</h2></div><p><b>{args.length}</b> 个签名变量 · 指针 {pointerRows.length} · 标量/形状/stride {args.length-pointerRows.length}</p></header>
-        <div className="pl-variable-grid">{argRows.map((arg,i) => <button key={`${arg.name}-${i}`} className={`${arg.kind} ${selectedVar?.name === arg.name ? "active" : ""}`} onClick={() => setVariable(arg.name)}><span>{String(i+1).padStart(2,"0")} · {KIND_TEXT[arg.kind]} · {arg.loaded ? "tl.load" : "no load"}{arg.stored ? " + tl.store" : ""}</span><code>{arg.name}</code><b>{sampleValue(arg.name,arg.kind,shape,block)}</b><p>{explainArg(arg.name,arg.kind)}</p></button>)}</div>
-        {selectedVar && <div className="pl-variable-trace"><div><span>选中变量</span><code>{selectedVar.name}</code><b>{KIND_TEXT[selectedVar.kind]}</b></div><p><span>当前 lane 地址</span><code>{addressFormula(selectedVar.name,selectedVar.kind,activeCoord)}</code></p><p><span>load 值</span><code>{sampleValue(selectedVar.name,selectedVar.kind,shape,block,activeCoord.lane)}</code></p><p><span>进入计算</span><code>{selected.compute}</code></p><p><span>store</span><code>{selectedVar.kind === "output" || selectedVar.kind === "inout" ? selected.store : "此变量只读；结果写到输出变量"}</code></p></div>}
+        <header><div><span>ALL KERNEL ARGUMENTS</span><h2>每个变量是什么、什么 shape、从模型哪里传入</h2></div><p><b>{args.length}</b> 个签名变量 · 指针 {pointerRows.length} · 标量/形状/stride {args.length-pointerRows.length}</p></header>
+        <div className="pl-variable-grid">{argRows.map((arg,i) => <button key={`${arg.name}-${i}`} className={`${arg.kind} ${selectedVar?.name === arg.name ? "active" : ""}`} onClick={() => setVariable(arg.name)}><span>{String(i+1).padStart(2,"0")} · {KIND_TEXT[arg.kind]} · {arg.loaded ? "tl.load" : "no load"}{arg.stored ? " + tl.store" : ""}</span><code>{arg.name}</code><p className="pl-arg-meaning">{arg.meaning}</p><dl><div><dt>SHAPE</dt><dd>{arg.shape}</dd></div><div><dt>调用时</dt><dd>{arg.caller}</dd></div></dl></button>)}</div>
+        {selectedVar && <div className="pl-variable-trace"><div><span>选中变量</span><code>{selectedVar.name}</code><b>{KIND_TEXT[selectedVar.kind]}</b></div><p><span>变量含义</span><b>{selectedVar.meaning}</b></p><p><span>实际 / 符号 shape</span><code>{selectedVar.shape}</code></p><p><span>模型调用时对应</span><b>{selectedVar.caller}</b></p><p><span>当前 lane 地址</span><code>{addressFormula(selectedVar.name,selectedVar.kind,activeCoord)}</code></p></div>}
       </section>
 
       <section className={`pl-memory-panel ${step >= 3 && step <= 6 ? "focus" : ""}`}>
@@ -259,7 +345,7 @@ function KernelProductionLab() {
 
       <section className={`pl-torch-panel ${step===7 ? "focus" : ""}`}>
         <div><span>TRITON 过程</span><p><b>Grid</b>{selected.grid}</p><p><b>Load</b>{selected.load}</p><p><b>Compute</b>{selected.compute}</p><p><b>Store</b>{selected.store}</p></div>
-        <div><span>PYTORCH 语义参考</span><pre><code>{selected.torch}</code></pre><p>PyTorch 对照保证数学语义；它不会复现 Triton 的 program 数量、地址向量、UB 生命周期或 NPU 并行映射。</p></div>
+        <div><span>PYTORCH 语义参考</span><pre><code>{selected.torch}</code></pre><p>PyTorch 对照保证数学语义；它不会复现 Triton 的 program 数量、地址向量、UB 生命周期或 NPU 并行映射。</p><p className="pl-call-sources"><a href={sourceUrl} target="_blank" rel="noreferrer">sgl-kernel-npu wrapper / kernel ↗</a><a href={`${SGLANG_ROOT}/srt`} target="_blank" rel="noreferrer">SGLang 模型与后端调用点 ↗</a></p></div>
       </section>
 
       <p className="pl-boundary"><b>模拟边界：</b>坐标、mask、stride 公式和源码签名是可核对的；页面使用缩小后的教学 shape 展开。最终 GM 合并访存、UB/寄存器实际分配、Vector/Cube 映射、流水与双缓冲由 Triton‑Ascend 编译器和具体 NPU 决定。</p>

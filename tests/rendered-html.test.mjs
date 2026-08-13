@@ -32,6 +32,8 @@ test("server-renders the full production kernel lab", async () => {
   assert.match(html, /GRID \/ PROGRAM MAP/);
   assert.match(html, /BLOCK \/ LANE ADDRESSING/);
   assert.match(html, /ALL KERNEL ARGUMENTS/);
+  assert.match(html, /每个变量是什么、什么 shape、从模型哪里传入/);
   assert.match(html, /GM → UB \/ REG → GM/);
   assert.match(html, /源码中的 tl\.load/);
+  assert.doesNotMatch(html, /基址不等于元素地址/);
 });

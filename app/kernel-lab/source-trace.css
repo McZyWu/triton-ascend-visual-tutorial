@@ -7,3 +7,6 @@
 .pl-source-trace>div:nth-child(3) code{border-left-color:var(--orange)}
 @media(max-width:800px){.pl-source-trace{grid-template-columns:1fr}}
 .pl-variable-grid button.inout{border-top:3px solid #bd8cff}
+.variable-semantics-v2 .pl-variable-grid button{min-height:210px}.variable-semantics-v2 .pl-variable-grid .pl-arg-meaning{font-size:10px;color:var(--ink);min-height:30px}.variable-semantics-v2 .pl-variable-grid dl{margin:10px 0 0;border-top:1px solid var(--line)}.variable-semantics-v2 .pl-variable-grid dl>div{display:grid;grid-template-columns:42px 1fr;gap:7px;padding-top:7px}.variable-semantics-v2 .pl-variable-grid dt{font:7px var(--mono);color:#5b7100}.variable-semantics-v2 .pl-variable-grid dd{margin:0;font-size:8px;line-height:1.45;color:var(--muted)}.variable-semantics-v2 .pl-variable-trace{grid-template-columns:180px 1.25fr 1fr 1.25fr 1fr}.variable-semantics-v2 .pl-call-sources{display:flex;gap:8px;flex-wrap:wrap}.variable-semantics-v2 .pl-call-sources a{border:1px solid var(--line);padding:7px 9px;color:#4d6600;font:8px var(--mono)}
+@media(max-width:1100px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr 1fr}}
+@media(max-width:720px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr}}
