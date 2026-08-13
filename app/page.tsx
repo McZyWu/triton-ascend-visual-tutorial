@@ -190,6 +190,22 @@ function TransferLab() {
     : dims === 2
       ? `y = pidᵧ×Bᵧ+laneᵧ；x = pidₓ×Bₓ+laneₓ；offset = y×W+x`
       : `z/y/x = pid×BLOCK+lane；offset = (z×H+y)×W+x`;
+  const exampleLane = lanes[0];
+  const globalDerivation = dims === 1
+    ? `x = pidₓ(${safePid[2]}) × Bₓ(${activeBlock[2]}) + laneₓ(${exampleLane.local[2]}) = ${exampleLane.global[2]}`
+    : dims === 2
+      ? `y = ${safePid[1]}×${activeBlock[1]}+${exampleLane.local[1]} = ${exampleLane.global[1]}；x = ${safePid[2]}×${activeBlock[2]}+${exampleLane.local[2]} = ${exampleLane.global[2]}`
+      : `z = ${safePid[0]}×${activeBlock[0]}+${exampleLane.local[0]} = ${exampleLane.global[0]}；y = ${safePid[1]}×${activeBlock[1]}+${exampleLane.local[1]} = ${exampleLane.global[1]}；x = ${safePid[2]}×${activeBlock[2]}+${exampleLane.local[2]} = ${exampleLane.global[2]}`;
+  const offsetDerivation = dims === 1
+    ? `offset = x = ${exampleLane.offset}`
+    : dims === 2
+      ? `offset = y×W+x = ${exampleLane.global[1]}×${activeShape[2]}+${exampleLane.global[2]} = ${exampleLane.offset}`
+      : `offset = (z×H+y)×W+x = (${exampleLane.global[0]}×${activeShape[1]}+${exampleLane.global[1]})×${activeShape[2]}+${exampleLane.global[2]} = ${exampleLane.offset}`;
+  const maskDerivation = dims === 1
+    ? `${exampleLane.global[2]} < N(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`
+    : dims === 2
+      ? `y(${exampleLane.global[1]}) < H(${activeShape[1]}) 且 x(${exampleLane.global[2]}) < W(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`
+      : `z(${exampleLane.global[0]}) < D(${activeShape[0]}) 且 y(${exampleLane.global[1]}) < H(${activeShape[1]}) 且 x(${exampleLane.global[2]}) < W(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`;
 
   const programPlanes = Array.from({ length: grid[0] }, (_, pz) => (
     <div className="program-plane" key={pz}>
@@ -267,8 +283,24 @@ function TransferLab() {
         {programPlanes}
       </div>
       <div className="coordinate-ledger">
-        <div className="zone-title"><span>LANE → GLOBAL COORD → FLAT OFFSET</span><small>mask 在每一个维度分别判断越界</small></div>
-        <div className="coordinate-table"><div><b>local lane</b><b>global coord</b><b>flat offset</b><b>mask</b></div>{lanes.map((lane) => <div key={`coord-${lane.local.join("-")}`} className={lane.valid ? "" : "masked"}><code>{coordText(lane.local)}</code><code>{coordText(lane.global)}</code><code>{lane.offset}</code><strong>{lane.valid ? "TRUE" : "FALSE"}</strong></div>)}</div>
+        <div className="zone-title"><span>块内 LANE → 张量坐标 → 内存 OFFSET</span><small>每一行代表当前 program 同时处理的一个数据槽位</small></div>
+        <div className="coordinate-explainer">
+          <div className="coordinate-reading">
+            <span>这一行应该读成</span>
+            <b>{coordText(exampleLane.local)}</b><i>块内第几个槽位</i><em>→</em>
+            <b>{coordText(exampleLane.global)}</b><i>整个张量中的坐标</i><em>→</em>
+            <b>{exampleLane.offset}</b><i>从首地址数第几个元素</i><em>→</em>
+            <b className={exampleLane.valid ? "ok" : "no"}>{exampleLane.valid ? "TRUE" : "FALSE"}</b><i>{exampleLane.valid ? "允许 load / store" : "必须被 mask"}</i>
+          </div>
+          <div className="coordinate-derivation">
+            <p><b>① 块内坐标</b><code>{coordText(exampleLane.local)}</code><span>由 <code>tl.arange</code> 生成，只表示它在当前 block 内的位置。</span></p>
+            <p><b>② 张量坐标</b><code>{coordText(exampleLane.global)}</code><span>{globalDerivation}</span></p>
+            <p><b>③ 展平 offset</b><code>{exampleLane.offset}</code><span>{offsetDerivation}；所以访问 <code>x_ptr + {exampleLane.offset}</code>。</span></p>
+            <p><b>④ mask</b><code>{exampleLane.valid ? "TRUE" : "FALSE"}</code><span>{maskDerivation}</span></p>
+          </div>
+          <p className="coordinate-note"><b>注意：</b><code>offset</code> 是“元素下标”，不是字节数。若 dtype 是 fp32，第 {exampleLane.offset} 个元素的字节地址才是 <code>base + {exampleLane.offset} × 4</code>。</p>
+        </div>
+        <div className="coordinate-table"><div><b>① block 内坐标</b><b>② 张量全局坐标</b><b>③ 首地址 + 元素下标</b><b>④ 可否访问</b></div>{lanes.map((lane) => <div key={`coord-${lane.local.join("-")}`} className={lane.valid ? "" : "masked"}><code>{coordText(lane.local)}</code><code>{coordText(lane.global)}</code><code>base + {lane.offset}</code><strong>{lane.valid ? "TRUE · 搬运" : "FALSE · 跳过"}</strong></div>)}</div>
       </div>
       <div className="memory-stage-v2" aria-label={`${dims}维 X 和 Y 从全局内存搬到统一缓冲区、相加并写回 C 的模拟`}>
         <div className={`memory-column gm ${phase === 2 ? "active" : ""}`}>
