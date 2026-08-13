@@ -338,13 +338,14 @@ function ParallelLab() {
       <div className="lab-toolbar">
         <label>total_tasks <input type="range" min="5" max="18" value={tasks} onChange={(e) => { setTasks(+e.target.value); setTick(0); }} /><b>{tasks}</b></label>
         <label>grid / kernel_num <input type="range" min="2" max="6" value={cores} onChange={(e) => { setCores(+e.target.value); setTick(0); }} /><b>{cores}</b></label>
-        <button className="action" onClick={() => setTick((tick + 1) % (rounds + 1))}>推进一轮 →</button>
+        <label>当前循环轮次 k <b>{tick < rounds ? tick : "结束"}</b></label>
+        <button className="action" onClick={() => setTick((tick + 1) % (rounds + 1))}>推进一轮 k →</button>
       </div>
       <div className="parallel-map">
         {assignments.map((lane, pid) => <div className="core-lane" key={pid}>
           <div className="core-label"><i />Program {pid}<small>pid={pid}</small></div>
           <div className="timeline">
-            {lane.map((task, r) => <div key={task} className={`task ${r < tick ? "done" : r === tick ? "now" : ""}`}><b>task {task}</b><small>{pid} + {r}×{cores}</small></div>)}
+            {lane.map((task, k) => <div key={task} className={`task ${k < tick ? "done" : k === tick ? "now" : ""}`}><b>k={k} → task {task}</b><small>{pid} + {k}×{cores} = {task}</small></div>)}
           </div>
         </div>)}
       </div>
@@ -510,7 +511,7 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
           <div className="concept-row">
             <article><b>1D grid</b><code>pid = tl.program_id(0)</code><p>向量、行归约常用。第 pid 个 program 处理一段连续元素或若干 token。</p></article>
             <article><b>2D grid</b><code>pid_m, pid_n</code><p>矩阵 tile 常用。一个 program 对应输出矩阵中的一个二维块。</p></article>
-            <article><b>Persistent grid</b><code>task = pid + k×P</code><p>program 数贴近核心数，循环领取更多任务，减少过多 program 的调度开销。</p></article>
+            <article className="persistent-concept"><b>Persistent grid</b><code>task = pid + k×P</code><p>program 数贴近核心数，同一个 program 留在设备上循环领取任务。</p><dl><div><dt>k</dt><dd>循环轮次，从 0 开始：0、1、2…；不是新的 program_id</dd></div><div><dt>P</dt><dd>Grid 中 program 总数，即 <code>tl.num_programs(0)</code></dd></div><div><dt>停止</dt><dd>当 <code>pid + k×P ≥ total_tasks</code> 时不再领取</dd></div></dl></article>
           </div>
           <ParallelLab />
           <div className="grid-math"><div><span>向量加</span><strong>grid = (ceil(N / BLOCK),)</strong><small>N=98,432；BLOCK=1,024 → 97 programs</small></div><div><span>RMSNorm</span><strong>grid = (num_vectorcore,)</strong><small>total_tasks = ceil(B×L / block_l)，跨步消费</small></div><div><span>二维矩阵</span><strong>grid = (ceil(M/BM), ceil(N/BN))</strong><small>program (pm,pn) → C 的 [BM,BN] tile</small></div></div>
