@@ -170,6 +170,8 @@ function TransferLab() {
     return () => window.clearInterval(timer);
   }, [playing]);
   useEffect(() => {
+    // The selected program must be clamped when the user changes shape/dimension.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPid((current) => current.map((value, axis) => Math.min(value, Math.max(0, grid[axis] - 1))) as [number, number, number]);
     setPhase(0);
   }, [dims, grid[0], grid[1], grid[2]]);
@@ -471,7 +473,7 @@ function CaseSimulator() {
   return (
     <div className="kernel-atlas">
       <div className="kernel-atlas-head">
-        <div><span>UPSTREAM INVENTORY · MAIN</span><strong>{KERNEL_OPS.length} modules · {TOTAL_TRITON_KERNELS} kernels</strong><p>统计范围：<code>python/sgl_kernel_npu/sgl_kernel_npu</code> 中含 <code>@triton.jit</code> 的模块；同一公开算子的内部 kernel 合并为一个模拟条目。</p></div>
+        <div><span>UPSTREAM INVENTORY · MAIN</span><strong>{KERNEL_OPS.length} modules · {TOTAL_TRITON_KERNELS} kernels</strong><p>这里用于快速选算子；完整的变量 load、地址、Grid/Block、UB、计算与 store 模拟在独立实验室中展开。</p><a className="kernel-lab-launch" href="/kernel-lab" target="_blank" rel="noreferrer">新窗口打开全屏算子实验室 ↗</a></div>
         <label>查找算子 / kernel<input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="例如 rmsnorm / decode / cache" /></label>
       </div>
       <div className="kernel-group-tabs" aria-label="算子分类">{KERNEL_GROUPS.map(g => <button key={g} className={group === g ? "active" : ""} onClick={() => {
@@ -485,7 +487,7 @@ function CaseSimulator() {
           {!visible.length && <p>没有匹配的算子。</p>}
         </aside>
         <div className="kernel-stage">
-          <header><div><span>{selected.group}</span><h3>{selected.title}</h3><code>{selected.module}</code></div><a href={`https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/sgl_kernel_npu/${selected.module}`} target="_blank" rel="noreferrer">源码 ↗</a></header>
+          <header><div><span>{selected.group}</span><h3>{selected.title}</h3><code>{selected.module}</code></div><div className="kernel-stage-links"><a href={`/kernel-lab?op=${selected.id}&kernel=${encodeURIComponent(selectedKernel)}`} target="_blank" rel="noreferrer">全屏详细模拟 ↗</a><a href={`https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/sgl_kernel_npu/${selected.module}`} target="_blank" rel="noreferrer">源码 ↗</a></div></header>
           <div className="kernel-name-list"><span>选择本模块的 JIT kernel</span>{selected.kernels.map((name, i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { setKernelIndex(i); setPhase(0); }}><code>{name}</code></button>)}</div>
           <div className="kernel-phase-tabs">{phases.map((item, i) => <button key={item.key} className={phase === i ? "active" : phase > i ? "done" : ""} onClick={() => setPhase(i)}><b>{item.key}</b><span>{i + 1}</span></button>)}</div>
           <div className="kernel-memory-sim">
@@ -609,7 +611,7 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         </section>
 
         <section id="cases" className="cases-section">
-          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>把 SGL Kernel NPU 的 Triton 算子逐个跑一遍。</h2><p>覆盖当前主分支 47 个含 Triton 的 Python 模块、83 个 JIT kernel：逐步查看 Grid 如何领取 task、输入如何进入 UB、片上怎样计算，以及结果或状态如何写回。</p></div>
+          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>这里选算子，在全屏实验室逐个跑。</h2><p>覆盖当前主分支 47 个含 Triton 的 Python 模块、{TOTAL_TRITON_KERNELS} 个 JIT kernel。点击“全屏详细模拟”，在新窗口逐变量检查 Grid、program、Block lane、GM 地址、load、UB、计算和 store。</p><a className="cases-launch" href="/kernel-lab" target="_blank" rel="noreferrer">新窗口打开 Production Kernel Lab <b>↗</b></a></div>
           <CaseSimulator />
           <h3 className="subhead">4 个代表性算子的输入输出速查</h3>
           <div className="case-list">{CASES.map((item) => <article key={item.id}>
