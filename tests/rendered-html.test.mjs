@@ -21,6 +21,9 @@ test("server-renders the Triton Ascend tutorial", async () => {
   assert.match(html, /06 \/ PRODUCTION CASES/);
   assert.match(html, /\/kernel-lab/);
   assert.match(html, /84<!-- --> 个 JIT kernel|84 个 JIT kernel/);
+  assert.match(html, /Tile 是工作块，lane 是块内位置/);
+  assert.match(html, /lane 3/);
+  assert.match(html, /lane 5/);
   assert.doesNotMatch(html, /Your site is taking shape|codex-preview/);
 });
 

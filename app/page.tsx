@@ -504,6 +504,22 @@ export default function Home() {
             <article><span>软件</span><b>Python 3.9–3.11</b><p>CANN 推荐 9.0.0；quick start 当前匹配 torch_npu 2.7.1.post4。</p></article>
             <article><span>安装</span><b>triton-ascend 3.2.1+</b><p>此版本起声明 Triton 依赖，缓解后装依赖覆盖 Ascend 版本的问题。</p></article>
           </div>
+          <div className="lane-tile-primer">
+            <header><span>先认清两个词</span><h3>Tile 是工作块，lane 是块内位置。</h3><p><b>tile</b> 是一个 Triton program 当前一轮处理的逻辑数据块；每个输入、输出变量可以拥有自己的 tile。<b>lane</b> 是 tile 内展平后的逻辑位置编号，经 tile 起点、shape 与 stride 换算后才得到全局元素地址。这里的 lane 不是 CUDA 线程编号，也不保证对应一个真实 NPU 执行通道。</p></header>
+            <div className="lane-example one-d">
+              <div className="lane-example-title"><span>1D EXAMPLE</span><b>BLOCK_SIZE = 8 · N = 20 · pid = 2</b></div>
+              <code>tile 起点 = pid × BLOCK_SIZE = 16</code>
+              <div className="lane-strip">{Array.from({ length: 8 }, (_, lane) => <i key={lane} className={lane >= 4 ? "masked" : ""}><small>lane {lane}</small><b>{16 + lane}</b></i>)}</div>
+              <p><code>lane 3</code> → local <code>3</code> → global <code>16 + 3 = 19</code> → <b>19 &lt; N，mask=true</b>。lane 4 对应 global 20，已经越界。</p>
+            </div>
+            <div className="lane-example two-d">
+              <div className="lane-example-title"><span>2D EXAMPLE</span><b>BLOCK_M = 2 · BLOCK_N = 4 · pid = [1,2]</b></div>
+              <code>local_m = lane // 4 · local_n = lane % 4</code>
+              <div className="lane-matrix">{Array.from({ length: 8 }, (_, lane) => <i key={lane} className={lane === 5 ? "active" : ""}><small>{lane}</small><b>[{Math.floor(lane / 4)},{lane % 4}]</b></i>)}</div>
+              <p><code>lane 5</code> → local <code>[1,1]</code>；tile 起点是 <code>[2,8]</code>，所以 global <code>[3,9]</code>。若完整 shape 是 <code>[5,10]</code>，flat offset = <code>3 × 10 + 9 = 39</code>。</p>
+            </div>
+            <footer><code>lane → local coord → global coord → flat offset → mask → tl.load / tl.store</code></footer>
+          </div>
           <div className="setup-grid">
             <div>
               <h3><span>①</span> 安装 wheel</h3>
