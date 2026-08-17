@@ -54,4 +54,16 @@ test("server-renders the profiling evidence page", async () => {
   assert.match(html, /kernel_details\.csv/);
   assert.match(html, /chrome:\/\/tracing\//);
   assert.match(html, /mul-add-trace-view\.json/);
+  assert.match(html, /01 \/ SINGLE OP CAPTURE/);
+  assert.match(html, /02 \/ PIPELINE &amp; TRACE\.JSON/);
+  assert.match(html, /03 \/ HOTSPOT/);
+  assert.match(html, /04 \/ BOUND/);
+  assert.match(html, /05 \/ OPTIMIZE/);
+  assert.match(html, /06 \/ RESULTS &amp; BENEFIT/);
+  assert.match(html, /_situ_deepep_kernel_0/);
+  assert.match(html, /split_qkv_rmsnorm_rope_kernel_0/);
+  assert.match(html, /Start Time\(us\)/);
+  assert.match(html, /aiv_mte2_time \/ ratio/);
+  assert.match(html, /k3-qwen-trace-extract\.json/);
+  assert.match(html, /不同 shape 不计算 speedup/);
 });
