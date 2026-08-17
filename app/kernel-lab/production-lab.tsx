@@ -6,6 +6,7 @@ import Link from "next/link";
 import { KERNEL_GROUPS, KERNEL_OPS, type KernelOp, TOTAL_TRITON_KERNELS } from "../kernel-ops";
 import { KERNEL_SIGNATURES } from "../kernel-signatures";
 import { KERNEL_CALL_BINDINGS } from "../kernel-call-bindings";
+import { KERNEL_SOURCE_LOADERS, VISUAL_SOURCE, type KernelSourceSegment, type SourcePhase } from "../kernel-source-segments";
 
 type ArgKind = "input" | "output" | "inout" | "index" | "stride" | "shape" | "block" | "flag" | "scalar" | "helper";
 type Coord = { lane: number; local: number[]; global: number[]; flat: number; valid: boolean };
@@ -16,10 +17,14 @@ const STEPS = [
   ["STORE", "逐变量 store"], ["TORCH", "Torch 对照"],
 ] as const;
 
-const SOURCE_ROOT = "https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/sgl_kernel_npu";
+const SOURCE_ROOT = `https://github.com/sgl-project/sgl-kernel-npu/blob/${VISUAL_SOURCE.commit}/python/sgl_kernel_npu/sgl_kernel_npu`;
 const SGLANG_ROOT = "https://github.com/sgl-project/sglang/blob/main/python/sglang";
+const PHASE_STEP: Record<SourcePhase, number> = { program:1, offset:2, load:3, compute:5, store:6 };
+const PHASE_TEXT: Record<SourcePhase, string> = { program:"PROGRAM / TASK", offset:"OFFSET / MASK", load:"GM → UB", compute:"UB COMPUTE", store:"UB → GM" };
 
 type ArgMeaning = { meaning: string; shape: string; caller: string };
+type LabProfile = { labels: string[]; shape: number[]; block: number[]; persistent: boolean; programCap?: number };
+type UbItem = { name: string; source: string; formula: string; elements: number; bytesPerElement: number; bytes: number; phase: "load" | "compute" };
 
 const EXACT_ARG_MEANINGS: Record<string, Partial<ArgMeaning>> = {
   hidden_states: { meaning:"MLP/GEMM 产生的 gate-up 融合 hidden states", shape:"[tokens, 2 × intermediate_size]", caller:"模型 MLP 激活输入" },
@@ -151,14 +156,76 @@ function meaningFromName(name: string, kind: ArgKind, op: KernelOp, callerExpres
   };
 }
 
-function profileFor(op: KernelOp) {
+function profileFor(op: KernelOp): LabProfile {
   const persistent = /persistent/i.test(op.grid);
+  if (op.id === "muladd") return { labels:["batch_rows","unused grid axis","hidden_size"], shape:[48,1,4096], block:[1,1,4096], persistent:true, programCap:40 };
   if (op.group === "Attention" || op.group === "Indexer") return { labels:["batch / Q-block","head / chunk","D / page lane"], shape:[4,6,16], block:[1,2,8], persistent };
   if (op.group === "FLA / KDA") return { labels:["sequence / chunk","head","K/V lane"], shape:[8,4,16], block:[1,1,8], persistent };
   if (op.group === "Mamba / Cache") return { labels:["request / layer","channel block","window / tail"], shape:[8,8,8], block:[1,2,4], persistent };
   if (op.group === "Norm / RoPE") return { labels:["token / row","head / column group","hidden lane"], shape:[8,4,32], block:[1,1,8], persistent };
   if (op.group === "MoE / Sample") return { labels:["token / request","expert / head","hidden / top-k"], shape:[8,4,16], block:[1,1,8], persistent };
   return { labels:["row / token","expert / group","hidden lane"], shape:[8,2,32], block:[1,1,8], persistent };
+}
+
+function symbolValue(symbol: string, shape: number[], block: number[]) {
+  const s = symbol.replace(/[()]/g, "").trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  if (/^(BLOCK_M|BLOCK_L|ROWS_PER_ITER|BT|MINIBLOCK_SIZE)$/i.test(s)) return block[0];
+  if (/^(BLOCK_N|BLOCK_H|BH)$/i.test(s)) return block[1];
+  if (/^(BLOCK_SIZE|BLOCK_C|COL_BLOCK_SIZE|BLOCK_D|BLOCK_V|BLOCK_K|BK|BV|BD)$/i.test(s)) return block[2];
+  if (/^(batch_size|batch_rows|M|L|T)$/i.test(s)) return shape[0];
+  if (/^(num_heads|heads|H)$/i.test(s)) return shape[1];
+  if (/^(hidden_size|output_dim|C|D|K|V|N)$/i.test(s)) return shape[2];
+  const division = s.match(/^([A-Za-z_]\w*|\d+)\s*\/\/\s*([A-Za-z_]\w*|\d+)$/);
+  if (division) return Math.max(1, Math.floor(symbolValue(division[1], shape, block) / symbolValue(division[2], shape, block)));
+  const subtraction = s.match(/^([A-Za-z_]\w*|\d+)\s*-\s*([A-Za-z_]\w*|\d+)$/);
+  if (subtraction) return Math.max(1, symbolValue(subtraction[1], shape, block) - symbolValue(subtraction[2], shape, block));
+  return 1;
+}
+
+function formulaElements(formula: string | null, shape: number[], block: number[], fallback: number) {
+  if (!formula || formula === "1") return formula === "1" ? 1 : fallback;
+  const value = formula.split("×").reduce((product, factor) => product * symbolValue(factor, shape, block), 1);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function pointerFromLoad(segment: KernelSourceSegment) {
+  return segment.variables.find(name => /(_ptr$|cache|buffer|table|indices)/i.test(name))
+    ?? segment.code.match(/tl\.load\(\s*([A-Za-z_]\w*)/)?.[1]
+    ?? "source pointer";
+}
+
+function ubModel(segments: KernelSourceSegment[], shape: number[], block: number[], exactMulAdd: boolean) {
+  if (exactMulAdd) {
+    const elements = 4096;
+    const items: UbItem[] = [
+      { name:"routed_values", source:"input1_ptr", formula:"BLOCK_SIZE = 4096", elements, bytesPerElement:2, bytes:8192, phase:"load" },
+      { name:"shared_values", source:"input2_ptr", formula:"BLOCK_SIZE = 4096", elements, bytesPerElement:2, bytes:8192, phase:"load" },
+      { name:"buffered_values", source:"routed_values × factor + shared_values", formula:"BLOCK_SIZE = 4096", elements, bytesPerElement:4, bytes:16384, phase:"compute" },
+    ];
+    return { items, peakBytes:32768, exact:true, formula:"8 KiB routed + 8 KiB shared + 16 KiB FP32 result = 32 KiB" };
+  }
+  const loads: UbItem[] = [];
+  const seenLoads = new Set<string>();
+  for (const segment of segments.filter(item => item.phase === "load" && item.result)) {
+    if (seenLoads.has(segment.result!)) continue;
+    seenLoads.add(segment.result!);
+    const source = pointerFromLoad(segment);
+    const elements = formulaElements(segment.tileFormula, shape, block, block[0] * block[1] * block[2]);
+    const bytesPerElement = /(idx|index|offset|table|length|lens)/i.test(`${source} ${segment.result}`) ? 4 : 2;
+    loads.push({ name:segment.result!, source, formula:segment.tileFormula ?? "scalar", elements, bytesPerElement, bytes:elements * bytesPerElement, phase:"load" });
+  }
+  const computes: UbItem[] = [];
+  const seenComputes = new Set<string>();
+  for (const segment of segments.filter(item => item.phase === "compute" && item.result && item.tileFormula && item.tileFormula !== "1")) {
+    if (seenComputes.has(segment.result!)) continue;
+    seenComputes.add(segment.result!);
+    const elements = formulaElements(segment.tileFormula, shape, block, block[0] * block[1] * block[2]);
+    computes.push({ name:segment.result!, source:`L${segment.lineStart} compute result`, formula:segment.tileFormula!, elements, bytesPerElement:4, bytes:elements * 4, phase:"compute" });
+  }
+  const largestTemporary = computes.reduce((largest, item) => item.bytes > largest.bytes ? item : largest, { bytes:0 } as UbItem);
+  const peakBytes = loads.reduce((sum, item) => sum + item.bytes, 0) + largestTemporary.bytes;
+  return { items:[...loads, ...computes], peakBytes, exact:false, formula:`Σ 当前 load tile + 最大 FP32 compute tile = ${peakBytes} B` };
 }
 
 function stableNumber(text: string) {
@@ -213,9 +280,13 @@ function KernelProductionLab() {
   const [block, setBlock] = useState(() => profileFor(selected).block);
   const [pid, setPid] = useState([0,0,0]);
   const [variable, setVariable] = useState("");
+  const [segmentId, setSegmentId] = useState("");
+  const [sourceModule, setSourceModule] = useState<{ module: string; kernels: Record<string, KernelSourceSegment[]> }>({ module:"", kernels:{} });
   const kernel = selected.kernels[Math.min(kernelIndex, selected.kernels.length - 1)];
   const signature = KERNEL_SIGNATURES[selected.module]?.[kernel];
   const callBinding = KERNEL_CALL_BINDINGS[selected.module]?.[kernel];
+  const sourceSegments = sourceModule.module === selected.module ? sourceModule.kernels[kernel] ?? [] : [];
+  const activeSegment = sourceSegments.find(item => item.id === segmentId);
   const args = useMemo(() => signature?.args ?? [], [signature]);
   const profile = profileFor(selected);
 
@@ -224,6 +295,13 @@ function KernelProductionLab() {
     const timer = window.setInterval(() => setStep(s => s === STEPS.length - 1 ? 0 : s + 1), 1100);
     return () => window.clearInterval(timer);
   }, [playing]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loader = KERNEL_SOURCE_LOADERS[selected.module];
+    if (loader) loader().then(kernels => { if (!cancelled) setSourceModule({ module:selected.module, kernels }); });
+    return () => { cancelled = true; };
+  }, [selected.module]);
 
   const argRows = args.map(name => {
     const kind = classifyArg(name, signature?.loads, signature?.stores);
@@ -235,7 +313,7 @@ function KernelProductionLab() {
   const selectedVar = argRows.find(x => x.name === variable) ?? pointerRows[0] ?? argRows[0];
   const grid = shape.map((n,i) => Math.max(1, Math.ceil(n / Math.max(1, block[i]))));
   const logicalTasks = grid[0] * grid[1] * grid[2];
-  const physicalPrograms = profile.persistent ? Math.min(8, logicalTasks) : logicalTasks;
+  const physicalPrograms = profile.persistent ? Math.min(profile.programCap ?? 8, logicalTasks) : logicalTasks;
   const directFlatPid = (pid[0] * grid[1] + pid[1]) * grid[2] + pid[2];
   const physicalPid = profile.persistent ? pid[0] : directFlatPid;
   const task = profile.persistent ? physicalPid + round * physicalPrograms : directFlatPid;
@@ -252,13 +330,13 @@ function KernelProductionLab() {
     return { lane, local, global, valid, flat:(global[0] * shape[1] + global[1]) * shape[2] + global[2] };
   });
   const activeCoord = coords.find(x => x.valid) ?? coords[0];
-  const workBytes = inputs.length * tileElements * 2 + Math.max(1, outputs.length) * tileElements * 4;
+  const ub = ubModel(sourceSegments, shape, block, selected.id === "muladd" && kernel === "mul_add_kernel" && shape[2] === 4096 && block[2] === 4096);
   const sourceUrl = `${SOURCE_ROOT}/${selected.module}#L${signature?.line ?? 1}`;
   const visible = KERNEL_OPS.filter(op => (group === "全部" || op.group === group) && `${op.title} ${op.module} ${op.kernels.join(" ")}`.toLowerCase().includes(query.toLowerCase()));
 
   const chooseOp = (op: KernelOp) => {
     const p = profileFor(op);
-    setSelectedId(op.id); setKernelIndex(0); setShape(p.shape); setBlock(p.block); setPid([0,0,0]); setRound(0); setStep(0); setPlaying(false); setVariable("");
+    setSelectedId(op.id); setKernelIndex(0); setShape(p.shape); setBlock(p.block); setPid([0,0,0]); setRound(0); setStep(0); setPlaying(false); setVariable(""); setSegmentId("");
     window.history.replaceState(null, "", `/kernel-lab?op=${encodeURIComponent(op.id)}`);
   };
   const changeAxis = (setter: (v: number[]) => void, values: number[], axis: number, value: number) => setter(values.map((x,i) => i === axis ? Math.max(1,value) : x));
@@ -266,12 +344,17 @@ function KernelProductionLab() {
     if (profile.persistent) return { flat, p:[flat,0,0] };
     return { flat, p:[Math.floor(flat/(grid[1]*grid[2])), Math.floor(flat/grid[2])%grid[1], flat%grid[2]] };
   });
+  const chooseSegment = (segment: KernelSourceSegment) => {
+    setSegmentId(segment.id); setStep(PHASE_STEP[segment.phase]); setPlaying(false);
+    const matchingVariable = segment.variables.find(name => args.includes(name));
+    if (matchingVariable) setVariable(matchingVariable);
+  };
 
   return <main className="production-lab-page variable-semantics-v2">
     <header className="pl-topbar">
       <Link href="/#cases">← 返回教程</Link>
-      <div><b>Triton Ascend · Production Kernel Lab</b><span>{KERNEL_OPS.length} modules / {TOTAL_TRITON_KERNELS} JIT kernels</span></div>
-      <a href={sourceUrl} target="_blank" rel="noreferrer">当前源码 ↗</a>
+      <div><b>Triton Ascend · Production Kernel Lab</b><span>{KERNEL_OPS.length} modules / {TOTAL_TRITON_KERNELS} JIT kernels · source cutoff {VISUAL_SOURCE.shortCommit}</span></div>
+      <Link href="/profiling">Profiling 实测 ↗</Link>
     </header>
 
     <aside className="pl-sidebar">
@@ -283,12 +366,12 @@ function KernelProductionLab() {
     <div className="pl-main">
       <section className="pl-title">
         <div><span>{selected.group} · {selected.module}</span><h1>{selected.title}</h1><p>{selected.input}</p></div>
-        <div className="pl-title-actions"><a href={sourceUrl} target="_blank" rel="noreferrer">在 GitHub 打开该 kernel ↗</a><code>{profile.persistent ? "PERSISTENT GRID" : "DIRECT GRID"}</code></div>
+        <div className="pl-title-actions"><a href={sourceUrl} target="_blank" rel="noreferrer">在 GitHub 打开该 kernel ↗</a><a href={`${VISUAL_SOURCE.repository}/commit/${VISUAL_SOURCE.commit}`} target="_blank" rel="noreferrer">可视化截止 commit {VISUAL_SOURCE.shortCommit} ↗</a><code>{profile.persistent ? "PERSISTENT GRID" : "DIRECT GRID"}</code></div>
       </section>
 
-      <section className="pl-kernel-picker"><b>本模块 JIT kernel</b>{selected.kernels.map((name,i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { setKernelIndex(i); setStep(0); setVariable(""); window.history.replaceState(null,"",`/kernel-lab?op=${selected.id}&kernel=${encodeURIComponent(name)}`); }}>{name}</button>)}</section>
+      <section className="pl-kernel-picker"><b>本模块 JIT kernel</b>{selected.kernels.map((name,i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { setKernelIndex(i); setStep(0); setVariable(""); setSegmentId(""); window.history.replaceState(null,"",`/kernel-lab?op=${selected.id}&kernel=${encodeURIComponent(name)}`); }}>{name}</button>)}</section>
 
-      <section className="pl-signature"><span>SOURCE SIGNATURE · line {signature?.line ?? "?"}</span><code>def {kernel}({args.join(", ")})</code><p>下面的变量清单直接来自该 <code>@triton.jit</code> 函数签名；点击变量可追踪它在当前 lane 的地址和值。</p></section>
+      <section className="pl-signature"><span>SOURCE SIGNATURE · line {signature?.line ?? "?"} · {sourceSegments.length} executable statements · commit {VISUAL_SOURCE.shortCommit}</span><code>def {kernel}({args.join(", ")})</code><p>变量清单来自该 <code>@triton.jit</code> 签名；下方每一段可执行源码都可点击，并会跳到对应的 Grid / Offset / Load / Compute / Store 可视化阶段。</p></section>
 
       <section className="pl-controls">
         <div><span>教学输入 shape</span>{profile.labels.map((label,i) => <label key={label}>{label}<input type="number" min="1" value={shape[i]} onChange={e => changeAxis(setShape,shape,i,+e.target.value)} /></label>)}</div>
@@ -296,9 +379,9 @@ function KernelProductionLab() {
         <div className="pl-derived"><p><span>源码 Grid</span><code>{selected.grid}</code></p><p><span>教学展开</span><code>grid = ({grid.join(", ")}) · {logicalTasks} tasks</code></p><p><span>当前 Tile</span><code>{block.join(" × ")} = {tileElements} lanes</code></p></div>
       </section>
 
-      <nav className="pl-steps" aria-label="模拟步骤">{STEPS.map(([key,label],i) => <button key={key} className={step === i ? "active" : step > i ? "done" : ""} onClick={() => {setStep(i);setPlaying(false)}}><span>{String(i+1).padStart(2,"0")}</span><b>{key}</b><small>{label}</small></button>)}</nav>
+      <nav className="pl-steps" aria-label="模拟步骤">{STEPS.map(([key,label],i) => <button key={key} className={step === i ? "active" : step > i ? "done" : ""} onClick={() => {setStep(i);setPlaying(false);setSegmentId("")}}><span>{String(i+1).padStart(2,"0")}</span><b>{key}</b><small>{label}</small></button>)}</nav>
 
-      <section className="pl-step-summary"><div><span>当前阶段</span><strong>{STEPS[step][1]}</strong></div><p>{[selected.grid, `program ${taskPid.join(",")} 正在处理 task ${task}`, `lane → local → global → flat offset；尾块由 mask 保护`, selected.load, `${selected.tile}；当前估算 ${(workBytes/1024).toFixed(2)} KiB`, selected.compute, selected.store, selected.torch][step]}</p><div className="pl-play"><button onClick={() => setStep(Math.max(0,step-1))} disabled={step===0}>←</button><button className="play" onClick={() => setPlaying(!playing)}>{playing ? "暂停" : "自动播放"}</button><button onClick={() => setStep(Math.min(STEPS.length-1,step+1))} disabled={step===STEPS.length-1}>→</button></div></section>
+      <section className="pl-step-summary"><div><span>当前阶段</span><strong>{STEPS[step][1]}</strong></div><p>{activeSegment?.explanation ?? [selected.grid, `program ${taskPid.join(",")} 正在处理 task ${task}`, `lane → local → global → flat offset；尾块由 mask 保护`, selected.load, `${selected.tile}；当前片上工作集 ${(ub.peakBytes/1024).toFixed(2)} KiB`, selected.compute, selected.store, selected.torch][step]}</p><div className="pl-play"><button onClick={() => setStep(Math.max(0,step-1))} disabled={step===0}>←</button><button className="play" onClick={() => setPlaying(!playing)}>{playing ? "暂停" : "自动播放"}</button><button onClick={() => setStep(Math.min(STEPS.length-1,step+1))} disabled={step===STEPS.length-1}>→</button></div></section>
 
       <section className={`pl-grid-panel ${step <= 1 ? "focus" : ""}`}>
         <header><div><span>GRID / PROGRAM MAP</span><h2>Grid 怎样拆成并行 task</h2></div><p>{profile.persistent ? <><code>task = pid + k × P</code>；P={physicalPrograms}，当前 k={round}，所以 task={physicalPid}+{round}×{physicalPrograms}={task}。</> : <>每个 program 直接领取一个逻辑 tile；program 坐标乘 BLOCK 得到 tile 起点。</>}</p></header>
@@ -330,17 +413,15 @@ function KernelProductionLab() {
         <div className="pl-memory-flow">
           <div className={`pl-mem-column gm ${step===3 ? "active" : ""}`}><span>GLOBAL MEMORY · INPUT</span>{inputs.map((arg,i)=><button key={`${arg.name}-${i}`} onClick={()=>setVariable(arg.name)} className={selectedVar?.name===arg.name?"selected":""}><code>{arg.name}</code><small>{arg.kind === "index" ? "先取索引，再二次寻址" : addressFormula(arg.name,arg.kind,activeCoord)}</small><b>{coords.slice(0,8).map(c=>c.valid?sampleValue(arg.name,arg.kind,shape,block,c.lane):"×").join("  ")}</b></button>)}</div>
           <div className={`pl-flow-arrow load ${step===3 ? "active" : ""}`}><b>tl.load</b><span>mask + other</span><i>→</i></div>
-          <div className={`pl-mem-column ub ${step===4 || step===5 ? "active" : ""}`}><span>UNIFIED BUFFER / REG</span>{inputs.map((arg,i)=><div key={`${arg.name}-${i}`}><code>{arg.name}_tile</code><small>{tileElements} elements · fp16/bf16≈{(tileElements*2/1024).toFixed(2)} KiB</small></div>)}<div className="acc"><code>acc / temporary</code><small>{tileElements} elements · fp32≈{(tileElements*4/1024).toFixed(2)} KiB</small></div><strong>教学峰值 ≈ {(workBytes/1024).toFixed(2)} KiB</strong></div>
+          <div className={`pl-mem-column ub ${step===4 || step===5 ? "active" : ""}`}><span>UNIFIED BUFFER / REG</span>{ub.items.map((item,i)=><div className={item.phase === "compute" ? "acc" : ""} key={`${item.name}-${i}`}><code>{item.name}</code><small>{item.formula} → {item.elements.toLocaleString()} elements × {item.bytesPerElement} B = {(item.bytes/1024).toFixed(2)} KiB</small><b>{item.phase === "load" ? `来自 ${item.source}` : `计算结果：${item.source}`}</b></div>)}{!ub.items.length && <div><code>scalar / compiler value</code><small>该 helper 没有显式 tile load；片上值由调用方传入。</small></div>}<strong>{ub.exact ? "编译产物核对" : "源码级工作集上界"} = {(ub.peakBytes/1024).toFixed(2)} KiB</strong></div>
           <div className={`pl-compute ${step===5 ? "active" : ""}`}><span>COMPUTE</span>{splitCompute(selected.compute).map((x,i)=><div key={`${x}-${i}`}><b>{i+1}</b><code>{x}</code></div>)}</div>
           <div className={`pl-flow-arrow store ${step===6 ? "active" : ""}`}><b>tl.store</b><span>same mask</span><i>→</i></div>
           <div className={`pl-mem-column out ${step===6 ? "active" : ""}`}><span>GLOBAL MEMORY · OUTPUT / STATE</span>{(outputs.length ? outputs : [{name:"return / compiler value",kind:"output" as ArgKind}]).map((arg,i)=><button key={`${arg.name}-${i}`} onClick={()=>setVariable(arg.name)}><code>{arg.name}</code><small>{addressFormula(arg.name,arg.kind,activeCoord)}</small><b>{coords.slice(0,8).map(c=>c.valid?`y${c.lane}`:"skip").join("  ")}</b></button>)}</div>
         </div>
-        <div className="pl-ub-ledger"><b>UB 逐项估算</b><code>{inputs.length} 个输入 tile × {tileElements} × 2 B + {Math.max(1,outputs.length)} 个输出/acc tile × {tileElements} × 4 B = {workBytes} B</code><span>这是按签名和教学 dtype 的显式工作集；实际编译器还会改变生命周期、对齐、复用与双缓冲。</span></div>
-        <div className="pl-source-trace">
-          <div><span>源码中的 tl.load</span>{signature?.loadExprs.length ? signature.loadExprs.map((expr,i)=><code key={`${expr}-${i}`}>{expr}</code>) : <code>这个 helper 没有直接 tl.load；值由调用方或参数传入。</code>}</div>
-          <div><span>源码中的关键赋值 / 计算</span>{signature?.computeExprs.length ? signature.computeExprs.map((expr,i)=><code key={`${expr}-${i}`}>{expr}</code>) : <code>{selected.compute}</code>}</div>
-          <div><span>源码中的 tl.store / atomic</span>{signature?.storeExprs.length ? signature.storeExprs.map((expr,i)=><code key={`${expr}-${i}`}>{expr}</code>) : <code>这个 helper 返回计算值，没有直接写 GM。</code>}</div>
-        </div>
+        <div className="pl-ub-ledger"><b>UB 逐项计算</b><code>{ub.formula}</code><span>{ub.exact ? <>209 编译缓存的 <code>.ascend.stack.size.record = 0x8000 = 32 KiB</code>，与上面逐项计算完全一致。</> : <>这是源码显式 load tile 加最大 FP32 中间 tile 的教学上界；编译器可能通过生命周期复用降低占用，也可能因对齐或双缓冲增加占用。</>}</span></div>
+        <div className="pl-source-map-head"><div><span>SOURCE → VISUAL STAGE</span><h2>每段代码如何驱动可视化</h2></div><p>以下列出本 kernel 的全部 {sourceSegments.length} 段可执行语句。点击任意一段，页面会切换到对应阶段；行号和链接固定在 <code>{VISUAL_SOURCE.shortCommit}</code>。</p></div>
+        <div className="pl-source-phase-legend">{Object.entries(PHASE_TEXT).map(([phase,label]) => <span className={phase} key={phase}>{label}</span>)}</div>
+        <div className="pl-source-segments">{sourceSegments.map((segment,index) => <article key={segment.id} className={`${segment.phase} ${segment.id === segmentId ? "active" : ""}`}><button className="pl-source-code" onClick={() => chooseSegment(segment)}><span><b>{String(index+1).padStart(2,"0")} · {PHASE_TEXT[segment.phase]}</b><i>L{segment.lineStart}{segment.lineEnd !== segment.lineStart ? `–${segment.lineEnd}` : ""}</i></span><pre><code>{segment.code}</code></pre><p>{segment.explanation}</p>{segment.tileFormula && <small>tile 公式：{segment.tileFormula} → {formulaElements(segment.tileFormula,shape,block,tileElements).toLocaleString()} elements</small>}</button><a href={`${SOURCE_ROOT}/${selected.module}#L${segment.lineStart}`} target="_blank" rel="noreferrer">打开固定版本源码 ↗</a></article>)}</div>
       </section>
 
       <section className={`pl-torch-panel ${step===7 ? "focus" : ""}`}>

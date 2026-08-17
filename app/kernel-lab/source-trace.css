@@ -1,12 +1,17 @@
-.pl-source-trace{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line)}
-.pl-source-trace>div{padding:14px;border-right:1px solid var(--line);min-width:0}
-.pl-source-trace>div:last-child{border:0}
-.pl-source-trace span{display:block;font:8px var(--mono);color:#5b7200;margin-bottom:7px}
-.pl-source-trace code{display:block;background:var(--paper2);border-left:3px solid var(--cyan);padding:7px;margin-top:5px;font-size:8px;overflow-wrap:anywhere;white-space:normal}
-.pl-source-trace>div:nth-child(2) code{border-left-color:var(--acid2)}
-.pl-source-trace>div:nth-child(3) code{border-left-color:var(--orange)}
-@media(max-width:800px){.pl-source-trace{grid-template-columns:1fr}}
+.pl-source-map-head{display:flex;align-items:flex-start;justify-content:space-between;gap:25px;padding:18px;border-top:1px solid var(--ink);border-bottom:1px solid var(--line);background:var(--paper)}
+.pl-source-map-head span{font:8px var(--mono);color:#5b7200}.pl-source-map-head h2{margin:3px 0 0;font-size:18px}.pl-source-map-head p{max-width:700px;margin:0;font-size:10px;color:var(--muted)}
+.pl-source-phase-legend{display:flex;gap:6px;flex-wrap:wrap;padding:11px 18px;border-bottom:1px solid var(--line);background:var(--paper2)}
+.pl-source-phase-legend span{padding:5px 8px;border-left:4px solid var(--line);background:var(--white);font:8px var(--mono)}
+.pl-source-phase-legend .program{border-color:#75a7ff}.pl-source-phase-legend .offset{border-color:#bd8cff}.pl-source-phase-legend .load{border-color:var(--cyan)}.pl-source-phase-legend .compute{border-color:var(--acid2)}.pl-source-phase-legend .store{border-color:var(--orange)}
+.pl-source-segments{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);max-height:980px;overflow:auto}
+.pl-source-segments article{position:relative;min-width:0;background:var(--white);border-left:5px solid var(--line)}
+.pl-source-segments article.program{border-color:#75a7ff}.pl-source-segments article.offset{border-color:#bd8cff}.pl-source-segments article.load{border-color:var(--cyan)}.pl-source-segments article.compute{border-color:var(--acid2)}.pl-source-segments article.store{border-color:var(--orange)}
+.pl-source-segments article.active{background:#f7fadf;box-shadow:inset 0 0 0 2px var(--ink)}
+.pl-source-code{display:block;width:100%;min-height:100%;padding:14px 14px 38px;border:0;background:transparent;text-align:left;cursor:pointer;color:var(--ink)}
+.pl-source-code>span{display:flex;justify-content:space-between;gap:10px;font:8px var(--mono);color:#536b00}.pl-source-code i{font-style:normal;color:var(--muted)}
+.pl-source-code pre{margin:9px 0 7px;padding:10px;background:var(--deep);color:#dce9e3;white-space:pre-wrap;overflow-wrap:anywhere;font-size:9px;line-height:1.5}.pl-source-code p{margin:0;font-size:9px;line-height:1.55;color:var(--muted)}.pl-source-code small{display:block;margin-top:7px;font:8px var(--mono);color:#536b00}
+.pl-source-segments article>a{position:absolute;left:14px;bottom:12px;font:8px var(--mono);color:#536b00;text-decoration:underline}
 .pl-variable-grid button.inout{border-top:3px solid #bd8cff}
 .variable-semantics-v2 .pl-variable-grid button{min-height:210px}.variable-semantics-v2 .pl-variable-grid .pl-arg-meaning{font-size:10px;color:var(--ink);min-height:30px}.variable-semantics-v2 .pl-variable-grid dl{margin:10px 0 0;border-top:1px solid var(--line)}.variable-semantics-v2 .pl-variable-grid dl>div{display:grid;grid-template-columns:42px 1fr;gap:7px;padding-top:7px}.variable-semantics-v2 .pl-variable-grid dt{font:7px var(--mono);color:#5b7100}.variable-semantics-v2 .pl-variable-grid dd{margin:0;font-size:8px;line-height:1.45;color:var(--muted)}.variable-semantics-v2 .pl-variable-trace{grid-template-columns:180px 1.25fr 1fr 1.25fr 1fr}.variable-semantics-v2 .pl-call-sources{display:flex;gap:8px;flex-wrap:wrap}.variable-semantics-v2 .pl-call-sources a{border:1px solid var(--line);padding:7px 9px;color:#4d6600;font:8px var(--mono)}
-@media(max-width:1100px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr 1fr}}
-@media(max-width:720px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr}}
+@media(max-width:1100px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr 1fr}.pl-source-segments{grid-template-columns:1fr}}
+@media(max-width:720px){.variable-semantics-v2 .pl-variable-trace{grid-template-columns:1fr}.pl-source-map-head{flex-direction:column}}

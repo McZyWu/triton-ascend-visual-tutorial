@@ -37,6 +37,21 @@ test("server-renders the full production kernel lab", async () => {
   assert.match(html, /ALL KERNEL ARGUMENTS/);
   assert.match(html, /每个变量是什么、什么 shape、从模型哪里传入/);
   assert.match(html, /GM → UB \/ REG → GM/);
-  assert.match(html, /源码中的 tl\.load/);
+  assert.match(html, /SOURCE → VISUAL STAGE/);
+  assert.match(html, /2a87cda/);
   assert.doesNotMatch(html, /基址不等于元素地址/);
+});
+
+test("server-renders the profiling evidence page", async () => {
+  const response = await render("/profiling");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /ASCEND PROFILING FIELD GUIDE/);
+  assert.match(html, /mul_add_kernel/);
+  assert.match(html, /2a87cda/);
+  assert.match(html, /32 KiB/);
+  assert.match(html, /MTE2/);
+  assert.match(html, /kernel_details\.csv/);
+  assert.match(html, /chrome:\/\/tracing\//);
+  assert.match(html, /mul-add-trace-view\.json/);
 });
