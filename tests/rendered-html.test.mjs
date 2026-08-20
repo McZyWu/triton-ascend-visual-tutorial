@@ -42,6 +42,17 @@ test("server-renders the full production kernel lab", async () => {
   assert.doesNotMatch(html, /基址不等于元素地址/);
 });
 
+test("mul-add exposes both draggable persistent rounds", async () => {
+  const response = await render("/kernel-lab?op=muladd");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /MoE Mul‑Add/);
+  assert.match(html, /persistent 轮次 k/);
+  assert.match(html, /data-round-max="1"/);
+  assert.match(html, /共 (?:<!-- -->)?2(?:<!-- -->)? 轮/);
+  assert.match(html, /可拖动滑块、点 ± 或用方向键/);
+});
+
 test("server-renders the profiling evidence page", async () => {
   const response = await render("/profiling");
   assert.equal(response.status, 200);

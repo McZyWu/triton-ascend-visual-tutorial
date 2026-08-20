@@ -264,6 +264,10 @@ function splitCompute(text: string) {
   return text.split(/；|→/).map(x => x.trim()).filter(Boolean);
 }
 
+function unflattenTask(task: number, grid: number[]) {
+  return [Math.floor(task / (grid[1] * grid[2])), Math.floor(task / grid[2]) % grid[1], task % grid[2]];
+}
+
 function KernelProductionLab() {
   const params = useSearchParams();
   const initialId = params.get("op") || KERNEL_OPS[0].id;
@@ -314,10 +318,13 @@ function KernelProductionLab() {
   const grid = shape.map((n,i) => Math.max(1, Math.ceil(n / Math.max(1, block[i]))));
   const logicalTasks = grid[0] * grid[1] * grid[2];
   const physicalPrograms = profile.persistent ? Math.min(profile.programCap ?? 8, logicalTasks) : logicalTasks;
+  const persistentRounds = profile.persistent ? Math.ceil(logicalTasks / physicalPrograms) : 1;
+  const maxRound = persistentRounds - 1;
   const directFlatPid = (pid[0] * grid[1] + pid[1]) * grid[2] + pid[2];
   const physicalPid = profile.persistent ? pid[0] : directFlatPid;
   const task = profile.persistent ? physicalPid + round * physicalPrograms : directFlatPid;
-  const taskPid = profile.persistent ? [Math.floor(task / (grid[1] * grid[2])) % grid[0], Math.floor(task / grid[2]) % grid[1], task % grid[2]] : pid;
+  const taskIsValid = task < logicalTasks;
+  const taskPid = profile.persistent ? unflattenTask(task, grid) : pid;
   const tileElements = block[0] * block[1] * block[2];
   const shownLanes = Math.min(32, tileElements);
   const coords: Coord[] = Array.from({ length: shownLanes }, (_, lane) => {
@@ -326,7 +333,7 @@ function KernelProductionLab() {
     const l0 = Math.floor(lane / (block[2] * block[1]));
     const local = [l0,l1,l2];
     const global = local.map((v,i) => taskPid[i] * block[i] + v);
-    const valid = global.every((v,i) => v < shape[i]);
+    const valid = taskIsValid && global.every((v,i) => v < shape[i]);
     return { lane, local, global, valid, flat:(global[0] * shape[1] + global[1]) * shape[2] + global[2] };
   });
   const activeCoord = coords.find(x => x.valid) ?? coords[0];
@@ -339,7 +346,10 @@ function KernelProductionLab() {
     setSelectedId(op.id); setKernelIndex(0); setShape(p.shape); setBlock(p.block); setPid([0,0,0]); setRound(0); setStep(0); setPlaying(false); setVariable(""); setSegmentId("");
     window.history.replaceState(null, "", `/kernel-lab?op=${encodeURIComponent(op.id)}`);
   };
-  const changeAxis = (setter: (v: number[]) => void, values: number[], axis: number, value: number) => setter(values.map((x,i) => i === axis ? Math.max(1,value) : x));
+  const changeAxis = (setter: (v: number[]) => void, values: number[], axis: number, value: number) => {
+    setRound(0);
+    setter(values.map((x,i) => i === axis ? Math.max(1,value) : x));
+  };
   const displayPrograms = Array.from({ length: Math.min(48, profile.persistent ? physicalPrograms : logicalTasks) }, (_, flat) => {
     if (profile.persistent) return { flat, p:[flat,0,0] };
     return { flat, p:[Math.floor(flat/(grid[1]*grid[2])), Math.floor(flat/grid[2])%grid[1], flat%grid[2]] };
@@ -385,10 +395,17 @@ function KernelProductionLab() {
 
       <section className={`pl-grid-panel ${step <= 1 ? "focus" : ""}`}>
         <header><div><span>GRID / PROGRAM MAP</span><h2>Grid 怎样拆成并行 task</h2></div><p>{profile.persistent ? <><code>task = pid + k × P</code>；P={physicalPrograms}，当前 k={round}，所以 task={physicalPid}+{round}×{physicalPrograms}={task}。</> : <>每个 program 直接领取一个逻辑 tile；program 坐标乘 BLOCK 得到 tile 起点。</>}</p></header>
-        {profile.persistent && <label className="pl-round">persistent 轮次 k <input type="range" min="0" max={Math.max(0,Math.ceil(logicalTasks/physicalPrograms)-1)} value={round} onChange={e => setRound(+e.target.value)} /><b>{round}</b></label>}
+        {profile.persistent && <div className="pl-round">
+          <label htmlFor="persistent-round">persistent 轮次 k</label>
+          <button type="button" onClick={() => setRound(current => Math.max(0, current - 1))} disabled={round === 0} aria-label="上一轮">−</button>
+          <input id="persistent-round" type="range" min={0} max={maxRound} step={1} value={round} onInput={e => setRound(Number(e.currentTarget.value))} onChange={e => setRound(Number(e.currentTarget.value))} aria-label="persistent 轮次 k" data-round-max={maxRound} />
+          <button type="button" onClick={() => setRound(current => Math.min(maxRound, current + 1))} disabled={round === maxRound} aria-label="下一轮">+</button>
+          <output htmlFor="persistent-round">k = <b>{round}</b> / {maxRound}</output>
+          <span>共 {persistentRounds} 轮；可拖动滑块、点 ± 或用方向键。第 {round} 轮只有 task &lt; {logicalTasks} 的 program 工作。</span>
+        </div>}
         <div className="pl-program-map">{displayPrograms.map(item => {
           const assignedTask = item.flat + round * physicalPrograms;
-          const assignedPid = [Math.floor(assignedTask / (grid[1] * grid[2])) % grid[0], Math.floor(assignedTask / grid[2]) % grid[1], assignedTask % grid[2]];
+          const assignedPid = unflattenTask(assignedTask, grid);
           const idle = profile.persistent && assignedTask >= logicalTasks;
           return <button key={item.flat} className={`${profile.persistent ? physicalPid === item.flat ? "active" : "" : pid.every((x,i)=>x===item.p[i]) ? "active" : ""} ${idle ? "idle" : ""}`} onClick={() => !idle && setPid(item.p)} disabled={idle}><b>P{item.flat}</b><span>{profile.persistent ? idle ? "idle" : `task ${assignedTask}` : `[${item.p.join(",")}]`}</span><small>{idle ? "本轮没有剩余 task" : `origin [${(profile.persistent ? assignedPid : item.p).map((x,i)=>x*block[i]).join(",")}]`}</small></button>;
         })}</div>
