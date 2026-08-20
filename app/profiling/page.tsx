@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Image from "next/image";
 import Link from "next/link";
-import { BoundCalculator, FieldExplorer, TraceViewer } from "./profiling-lab";
+import { BoundCalculator, FieldExplorer, MemoryGlossary, TraceViewer } from "./profiling-lab";
 import "./profiling.css";
 
 const CUTOFF = "2a87cda308d3c5e38c6a0da74c2146146efbe625";
@@ -34,7 +34,7 @@ export default function ProfilingPage() {
   return <main className="profile-page">
     <header className="pf-topbar">
       <Link href="/kernel-lab">← Production Kernel Lab</Link>
-      <div><b>ASCEND PROFILING FIELD GUIDE</b><span>采集 → 流水 → 热点 → Bound → 优化 → 验收</span></div>
+      <div><b>ASCEND PROFILING FIELD GUIDE</b><span>GM / UB → 采集 → 流水 → 热点 → Bound → 优化 → 验收</span></div>
       <a href={`https://github.com/sgl-project/sgl-kernel-npu/commit/${CUTOFF}`} target="_blank" rel="noreferrer">visual cutoff · 2a87cda ↗</a>
     </header>
 
@@ -43,9 +43,14 @@ export default function ProfilingPage() {
       <aside className="pf-provenance"><span>DATA PROVENANCE</span><b>209 · 2026-08-05</b><dl><div><dt>current capture</dt><dd>20,153 rows · 1,265 kernel names</dd></div><div><dt>baseline context</dt><dd>79,342 rows · 1,635 kernel names</dd></div><div><dt>two cases</dt><dd>Kimi-K3 + Qwen3.5/Next</dd></div><div><dt>trace source</dt><dd>299,671 events · exact extract</dd></div><div><dt>evidence rule</dt><dd>不同 shape 不计算 speedup</dd></div></dl><p>当前 SGLang 主线没有名为 Qwen3.6 的模型类；原任务中的“Qwen3.6/Next”在仓库证据中对应 Qwen3.5 与 Qwen3-Next 共享算子路径。</p></aside>
     </section>
 
-    <nav className="pf-jump" aria-label="Profiling 六部分">
-      <a href="#capture"><b>01</b>单算子采集</a><a href="#pipeline"><b>02</b>流水 / Trace</a><a href="#hotspot"><b>03</b>热点代码</a><a href="#bound"><b>04</b>Bound 计算</a><a href="#optimize"><b>05</b>怎么优化</a><a href="#results"><b>06</b>结果收益</a>
+    <nav className="pf-jump" aria-label="Profiling 专题目录">
+      <a href="#memory"><b>00</b>GM / UB</a><a href="#capture"><b>01</b>单算子采集</a><a href="#pipeline"><b>02</b>流水 / Trace</a><a href="#hotspot"><b>03</b>热点代码</a><a href="#bound"><b>04</b>Bound 计算</a><a href="#optimize"><b>05</b>怎么优化</a><a href="#results"><b>06</b>结果收益</a>
     </nav>
+
+    <section className="pf-section pf-memory" id="memory">
+      <header><span>00 / MEMORY TERMINOLOGY</span><h2>GM 是仓库，UB 是当前核的工作台</h2><p>完整张量放在 GM；一个 Triton program 当前一轮处理的 tile 通过 MTE2 搬入 UB，在片上完成 Vector/Cube 计算，再通过 MTE3 写回 GM。Profiling 能直接看到搬运流水时间，但不会直接告诉你 GM 字节量或 UB 峰值。</p></header>
+      <MemoryGlossary />
+    </section>
 
     <section className="pf-section" id="capture">
       <header><span>01 / SINGLE OP CAPTURE</span><h2>怎么采集、怎么读 <code>kernel_details.csv</code></h2><p>先把编译、host 调度和 NPU 执行拆开。固定 shape、dtype、CANN/Triton 版本与设备；预热编译后，只包围待测调用，并在每轮同步和校验数值。</p></header>

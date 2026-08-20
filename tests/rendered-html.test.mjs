@@ -47,6 +47,11 @@ test("server-renders the profiling evidence page", async () => {
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /ASCEND PROFILING FIELD GUIDE/);
+  assert.match(html, /00 \/ MEMORY TERMINOLOGY/);
+  assert.match(html, /GM 是仓库，UB 是当前核的工作台/);
+  assert.match(html, /每轮最低 GM 流量/);
+  assert.match(html, /真实 UB 峰值/);
+  assert.match(html, /MTE2\/MTE3 告诉你“搬运流水运行了多久”/);
   assert.match(html, /mul_add_kernel/);
   assert.match(html, /2a87cda/);
   assert.match(html, /32 KiB/);

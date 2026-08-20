@@ -2,6 +2,80 @@
 
 import { useMemo, useState } from "react";
 
+const TILE_OPTIONS = [256, 512, 1024, 2048, 4096] as const;
+
+function kib(bytes: number) {
+  return bytes >= 1024
+    ? (bytes / 1024).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " KiB"
+    : bytes + " B";
+}
+
+export function MemoryGlossary() {
+  const [tileElements, setTileElements] = useState(1024);
+  const gmLoadBytes = tileElements * 2 * 2;
+  const gmStoreBytes = tileElements * 2;
+  const ubBf16Buffers = tileElements * (2 + 2 + 4);
+  const ubPromotedBuffers = tileElements * (4 + 4 + 4);
+
+  return <div className="memory-glossary">
+    <div className="memory-definitions">
+      <article>
+        <span>GM · GLOBAL MEMORY</span>
+        <h3>设备全局内存</h3>
+        <p>容量大、延迟较高，所有核都能访问，通常就是设备侧 HBM / DDR。完整输入、权重和最终输出长期放在这里。</p>
+        <code>Profiler 不直接给“GM 占用量”</code>
+      </article>
+      <article>
+        <span>UB · UNIFIED BUFFER</span>
+        <h3>核旁片上工作区</h3>
+        <p>容量小、带宽高，保存当前 program 这一轮的 tile 和中间量。下一轮 task 通常复用同一片 UB。</p>
+        <code>kernel_details.csv 不直接给“UB 容量/占用”</code>
+      </article>
+    </div>
+
+    <div className="memory-path" role="img" aria-label="数据从 GM 经 MTE2 搬入 UB，在 Vector 或 Cube 流水计算，再经 MTE3 写回 GM">
+      <div className="memory-node gm-node"><span>容量大 · 片外</span><b>GM</b><code>input / weight / output</code></div>
+      <div className="memory-arrow load-arrow"><b>MTE2 · LOAD</b><span>GM → UB</span><i>↓</i></div>
+      <div className="memory-node ub-node"><span>容量小 · 片上 · 每个核</span><b>UB</b><code>当前 tile + 活跃中间量</code><em>Vector / Cube 在这里消费数据</em></div>
+      <div className="memory-arrow store-arrow"><i>↑</i><b>MTE3 · STORE</b><span>UB → GM</span></div>
+      <div className="memory-node gm-node gm-output"><span>写回全局结果</span><b>GM</b><code>final output</code></div>
+    </div>
+
+    <div className="memory-profiler-map">
+      <article><span>PROFILER 直接看到</span><b><code>aiv_mte2_time / ratio</code></b><p>搬入流水活动时间/占比；不是 GM 字节量，也不是 UB 容量。</p></article>
+      <article><span>PROFILER 直接看到</span><b><code>aiv_mte3_time / ratio</code></b><p>写回流水活动时间/占比；与 MTE2、Vector、Scalar 可能重叠。</p></article>
+      <article><span>需要自己计算</span><b>GM 最低流量</b><p><code>所有必要 load 字节 + store 字节</code>；重复读取必须重复计数。</p></article>
+      <article><span>需要编译证据</span><b>真实 UB 峰值</b><p>先按同时存活 tile 估算，再用 local-memory、<code>.stack</code> 或编译报告确认。</p></article>
+    </div>
+
+    <div className="memory-example">
+      <div className="memory-example-control">
+        <span>可调示例 · X + Y → C</span>
+        <label htmlFor="memory-tile-elements">每个 program 的 tile 元素数</label>
+        <select id="memory-tile-elements" value={tileElements} onChange={event => setTileElements(Number(event.target.value))}>
+          {TILE_OPTIONS.map(value => <option key={value} value={value}>{value.toLocaleString()} elements</option>)}
+        </select>
+        <code>X/Y/C = BF16 · compute = FP32</code>
+      </div>
+      <div className="memory-math">
+        <div><span>GM · load X + Y</span><b>{kib(gmLoadBytes)}</b><code>{tileElements} × 2 B × 2</code></div>
+        <i>+</i>
+        <div><span>GM · store C</span><b>{kib(gmStoreBytes)}</b><code>{tileElements} × 2 B</code></div>
+        <i>=</i>
+        <div className="memory-total"><span>每轮最低 GM 流量</span><b>{kib(gmLoadBytes + gmStoreBytes)}</b><code>不含 cache / 重复 load</code></div>
+      </div>
+      <div className="ub-estimate">
+        <span>UB 源码级工作集估算</span>
+        <b>{kib(ubBf16Buffers)} — {kib(ubPromotedBuffers)}</b>
+        <code>BF16 X/Y + FP32 C：{kib(ubBf16Buffers)}；若 X/Y 也物化为 FP32：{kib(ubPromotedBuffers)}</code>
+        <p>这只是当前一轮同时存活 payload 的范围，不是芯片 UB 总容量。对齐、临时量、生命周期复用和 multibuffer 都会改变编译后的真实占用。</p>
+      </div>
+    </div>
+
+    <div className="memory-warning"><b>最容易误读的地方</b><span>MTE2/MTE3 告诉你“搬运流水运行了多久”；它们不告诉你“UB 有多大、用了多少”。</span></div>
+  </div>;
+}
+
 const FIELDS = [
   { name: "Name", group: "身份", example: "_situ_deepep_kernel_0", meaning: "设备上真正执行的 kernel 名。先按它 groupby，统计 count、sum、median、P95，不能只看单行。" },
   { name: "Type", group: "身份", example: "kernel / runtime task", meaning: "Profiler 记录的任务类型或算子类型。不同 CANN 版本可能与 Name 相同，也可能是框架层类别。" },
