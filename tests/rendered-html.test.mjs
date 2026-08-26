@@ -51,6 +51,15 @@ test("mul-add exposes both draggable persistent rounds", async () => {
   assert.match(html, /data-round-max="1"/);
   assert.match(html, /共 (?:<!-- -->)?2(?:<!-- -->)? 轮/);
   assert.match(html, /可拖动滑块、点 ± 或用方向键/);
+  assert.match(html, /搬运播放与单步控制/);
+  assert.match(html, /播放搬运/);
+  assert.match(html, /单步后退/);
+  assert.match(html, /单步前进/);
+  const memoryFlow = html.indexOf('class="pl-memory-flow"');
+  const playbackControls = html.indexOf('class="pl-memory-controls"');
+  const ubLedger = html.indexOf('class="pl-ub-ledger"');
+  assert.ok(memoryFlow >= 0 && memoryFlow < playbackControls, "playback controls should follow the transfer visualization");
+  assert.ok(playbackControls < ubLedger, "playback controls should remain attached to the transfer visualization");
 });
 
 test("server-renders the profiling evidence page", async () => {

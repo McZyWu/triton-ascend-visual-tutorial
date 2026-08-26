@@ -391,7 +391,7 @@ function KernelProductionLab() {
 
       <nav className="pl-steps" aria-label="模拟步骤">{STEPS.map(([key,label],i) => <button key={key} className={step === i ? "active" : step > i ? "done" : ""} onClick={() => {setStep(i);setPlaying(false);setSegmentId("")}}><span>{String(i+1).padStart(2,"0")}</span><b>{key}</b><small>{label}</small></button>)}</nav>
 
-      <section className="pl-step-summary"><div><span>当前阶段</span><strong>{STEPS[step][1]}</strong></div><p>{activeSegment?.explanation ?? [selected.grid, `program ${taskPid.join(",")} 正在处理 task ${task}`, `lane → local → global → flat offset；尾块由 mask 保护`, selected.load, `${selected.tile}；当前片上工作集 ${(ub.peakBytes/1024).toFixed(2)} KiB`, selected.compute, selected.store, selected.torch][step]}</p><div className="pl-play"><button onClick={() => setStep(Math.max(0,step-1))} disabled={step===0}>←</button><button className="play" onClick={() => setPlaying(!playing)}>{playing ? "暂停" : "自动播放"}</button><button onClick={() => setStep(Math.min(STEPS.length-1,step+1))} disabled={step===STEPS.length-1}>→</button></div></section>
+      <section className="pl-step-summary"><div><span>当前阶段</span><strong>{STEPS[step][1]}</strong></div><p>{activeSegment?.explanation ?? [selected.grid, `program ${taskPid.join(",")} 正在处理 task ${task}`, `lane → local → global → flat offset；尾块由 mask 保护`, selected.load, `${selected.tile}；当前片上工作集 ${(ub.peakBytes/1024).toFixed(2)} KiB`, selected.compute, selected.store, selected.torch][step]}</p></section>
 
       <section className={`pl-grid-panel ${step <= 1 ? "focus" : ""}`}>
         <header><div><span>GRID / PROGRAM MAP</span><h2>Grid 怎样拆成并行 task</h2></div><p>{profile.persistent ? <><code>task = pid + k × P</code>；P={physicalPrograms}，当前 k={round}，所以 task={physicalPid}+{round}×{physicalPrograms}={task}。</> : <>每个 program 直接领取一个逻辑 tile；program 坐标乘 BLOCK 得到 tile 起点。</>}</p></header>
@@ -434,6 +434,14 @@ function KernelProductionLab() {
           <div className={`pl-compute ${step===5 ? "active" : ""}`}><span>COMPUTE</span>{splitCompute(selected.compute).map((x,i)=><div key={`${x}-${i}`}><b>{i+1}</b><code>{x}</code></div>)}</div>
           <div className={`pl-flow-arrow store ${step===6 ? "active" : ""}`}><b>tl.store</b><span>same mask</span><i>→</i></div>
           <div className={`pl-mem-column out ${step===6 ? "active" : ""}`}><span>GLOBAL MEMORY · OUTPUT / STATE</span>{(outputs.length ? outputs : [{name:"return / compiler value",kind:"output" as ArgKind}]).map((arg,i)=><button key={`${arg.name}-${i}`} onClick={()=>setVariable(arg.name)}><code>{arg.name}</code><small>{addressFormula(arg.name,arg.kind,activeCoord)}</small><b>{coords.slice(0,8).map(c=>c.valid?`y${c.lane}`:"skip").join("  ")}</b></button>)}</div>
+        </div>
+        <div className="pl-memory-controls" aria-label="搬运播放与单步控制">
+          <div><span>TRANSFER PLAYBACK</span><b>{String(step + 1).padStart(2,"0")} / {String(STEPS.length).padStart(2,"0")} · {STEPS[step][1]}</b><small>控制紧跟搬运图；可连续播放，也可逐阶段观察 Grid、Load、UB、Compute 和 Store。</small></div>
+          <div className="pl-play">
+            <button onClick={() => { setStep(Math.max(0,step-1)); setPlaying(false); }} disabled={step===0} aria-label="单步后退">← 单步后退</button>
+            <button className="play" onClick={() => setPlaying(!playing)} aria-label={playing ? "暂停播放" : "播放搬运"}>{playing ? "暂停播放" : "播放搬运"}</button>
+            <button onClick={() => { setStep(Math.min(STEPS.length-1,step+1)); setPlaying(false); }} disabled={step===STEPS.length-1} aria-label="单步前进">单步前进 →</button>
+          </div>
         </div>
         <div className="pl-ub-ledger"><b>UB 逐项计算</b><code>{ub.formula}</code><span>{ub.exact ? <>209 编译缓存的 <code>.ascend.stack.size.record = 0x8000 = 32 KiB</code>，与上面逐项计算完全一致。</> : <>这是源码显式 load tile 加最大 FP32 中间 tile 的教学上界；编译器可能通过生命周期复用降低占用，也可能因对齐或双缓冲增加占用。</>}</span></div>
         <div className="pl-source-map-head"><div><span>SOURCE → VISUAL STAGE</span><h2>每段代码如何驱动可视化</h2></div><p>以下列出本 kernel 的全部 {sourceSegments.length} 段可执行语句。点击任意一段，页面会切换到对应阶段；行号和链接固定在 <code>{VISUAL_SOURCE.shortCommit}</code>。</p></div>
