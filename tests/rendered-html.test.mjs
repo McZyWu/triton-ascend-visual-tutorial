@@ -24,6 +24,12 @@ test("server-renders the Triton Ascend tutorial", async () => {
   assert.match(html, /Tile 是工作块，lane 是块内位置/);
   assert.match(html, /lane 3/);
   assert.match(html, /lane 5/);
+  assert.match(html, /DATA MOVEMENT 播放与单步控制/);
+  const dataMovementStage = html.indexOf('class="memory-stage-v2"');
+  const dataMovementControls = html.indexOf('class="transfer-playback-controls"');
+  const dataMovementStep = html.indexOf('class="step-line"');
+  assert.ok(dataMovementStage >= 0 && dataMovementStage < dataMovementControls, "DATA MOVEMENT controls should follow the transfer visualization");
+  assert.ok(dataMovementControls < dataMovementStep, "DATA MOVEMENT controls should stay attached to the transfer visualization");
   assert.doesNotMatch(html, /Your site is taking shape|codex-preview/);
 });
 

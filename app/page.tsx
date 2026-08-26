@@ -265,10 +265,6 @@ function TransferLab() {
           {dims >= 2 && <label>pid_y <input type="range" min="0" max={grid[1] - 1} value={safePid[1]} onChange={(e) => setAxis(setPid, safePid, 1, +e.target.value)} /><b>{safePid[1]}</b></label>}
           <label>pid_x <input type="range" min="0" max={grid[2] - 1} value={safePid[2]} onChange={(e) => setAxis(setPid, safePid, 2, +e.target.value)} /><b>{safePid[2]}</b></label>
         </div>
-        <div className="transport-actions">
-        <button className="action" onClick={() => { setPhase(0); setPlaying(true); }}>{playing ? "搬运中…" : "▶ 播放搬运"}</button>
-        <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 5); }}>单步 →</button>
-        </div>
       </div>
       <div className="equation-strip">
         <span>shape = <strong>{dims === 1 ? `[${shape[2]}]` : dims === 2 ? `[${shape[1]}, ${shape[2]}]` : `[${shape.join(", ")}]`}</strong></span>
@@ -323,6 +319,13 @@ function TransferLab() {
         <div className={`memory-column output ${phase === 4 ? "active" : ""}`}>
           <div className="zone-title"><span>GM / OUTPUT C</span><small>只写 mask=true 的位置</small></div>
           {valueLayer("C", `output shape ${dims}D`, (lane) => lane.sum, phase >= 4, "var(--acid)")}
+        </div>
+      </div>
+      <div className="transfer-playback-controls" aria-label="DATA MOVEMENT 播放与单步控制">
+        <div><span>TRANSFER PLAYBACK</span><b>STEP {phase + 1} / 5 · {phases[phase]}</b><small>控制紧跟搬运展示；播放会从 Grid 开始连续演示，单步每次前进一个阶段。</small></div>
+        <div className="transport-actions">
+          <button className="action" onClick={() => { setPhase(0); setPlaying(true); }} aria-label="播放 DATA MOVEMENT 搬运过程">{playing ? "搬运中…" : "▶ 播放搬运"}</button>
+          <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 5); }} aria-label="DATA MOVEMENT 单步前进">单步 →</button>
         </div>
       </div>
       <div className="step-line"><b>STEP {phase + 1}/5</b><span>{phases[phase]}</span><code>{phase === 0 ? `pid = ${pidTuple} in grid ${gridTuple}` : phase === 1 ? offsetFormula : phase === 2 ? "x = tl.load(x_ptr + offsets, mask); y = tl.load(y_ptr + offsets, mask)" : phase === 3 ? "c = x + y  # X、Y、C 三组数值分开显示" : "tl.store(c_ptr + offsets, c, mask=mask)"}</code></div>
