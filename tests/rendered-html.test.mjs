@@ -30,6 +30,22 @@ test("server-renders the Triton Ascend tutorial", async () => {
   const dataMovementStep = html.indexOf('class="step-line"');
   assert.ok(dataMovementStage >= 0 && dataMovementStage < dataMovementControls, "DATA MOVEMENT controls should follow the transfer visualization");
   assert.ok(dataMovementControls < dataMovementStep, "DATA MOVEMENT controls should stay attached to the transfer visualization");
+  assert.match(html, /03B \/ STRIDE &amp; MEMORY LAYOUT/);
+  assert.ok(html.includes("Tensor 的逻辑解释 = storage + storage_offset + shape + stride"));
+  assert.ok(html.includes("element_offset = storage_offset + Σ index[d] × stride[d]"));
+  assert.match(html, /1D slice/);
+  assert.match(html, /2D transpose/);
+  assert.match(html, /3D permute/);
+  assert.match(html, /expand \/ stride=0/);
+  assert.match(html, /view size is not compatible|VIEW vs RESHAPE/);
+  assert.match(html, /CLONE vs CONTIGUOUS/);
+  assert.match(html, /CUSTOM KERNEL ABI/);
+  assert.match(html, /逻辑 Tensor contract → 尊重 stride/);
+  assert.match(html, /index_put_/);
+  assert.match(html, /as_strided/);
+  const strideSection = html.indexOf('id="stride"');
+  const parallelSection = html.indexOf('id="parallel"');
+  assert.ok(dataMovementControls < strideSection && strideSection < parallelSection, "stride tutorial should follow DATA MOVEMENT and precede Grid parallelism");
   assert.doesNotMatch(html, /Your site is taking shape|codex-preview/);
 });
 

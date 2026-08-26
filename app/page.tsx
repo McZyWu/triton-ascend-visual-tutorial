@@ -18,6 +18,7 @@ const NAV = [
   ["start", "01", "起步"],
   ["anatomy", "02", "拆解 Kernel"],
   ["transfer", "03", "搬运实验室"],
+  ["stride", "03B", "Stride 布局"],
   ["parallel", "04", "Grid 并行"],
   ["ub", "05", "UB 估算"],
   ["cases", "06", "真实算子"],
@@ -64,6 +65,53 @@ const API_ROWS = [
   ["x.stride(0)", "相邻行首地址距离", "PyTorch 同名；offset = row × stride_b + col"],
   ["@triton.jit", "将函数编译成设备 kernel", "torch.compile 是图级编译，语义层次不同"],
   ["kernel[grid](...)", "按 grid 启动 kernel", "普通 Torch 运算隐藏了设备 launch 细节"],
+];
+
+type StrideScenario = {
+  id: string;
+  label: string;
+  expression: string;
+  shape: number[];
+  stride: number[];
+  storageOffset: number;
+  storageSize: number;
+  layout: string;
+  explanation: string;
+};
+
+const STRIDE_SCENARIOS: StrideScenario[] = [
+  { id:"one", label:"1D 连续", expression:"x = torch.arange(5)", shape:[5], stride:[1], storageOffset:0, storageSize:5, layout:"CONTIGUOUS", explanation:"索引每加 1，storage 中向后跨 1 个元素。" },
+  { id:"one-slice", label:"1D slice", expression:"y = x[1::2]", shape:[2], stride:[2], storageOffset:1, storageSize:5, layout:"STRIDED · 有洞", explanation:"共享 x 的 storage；起点移到 1，每个逻辑元素跨 2 个物理元素。" },
+  { id:"two", label:"2D 连续", expression:"x = torch.arange(12).reshape(3, 4)", shape:[3,4], stride:[4,1], storageOffset:0, storageSize:12, layout:"CONTIGUOUS", explanation:"换一行跨 4 个元素，换一列跨 1 个元素。" },
+  { id:"transpose", label:"2D transpose", expression:"t = x.transpose(0, 1)", shape:[4,3], stride:[1,4], storageOffset:0, storageSize:12, layout:"DENSE PERMUTATION", explanation:"不搬数据，只交换 shape 与 stride；逻辑相邻元素不一定物理相邻。" },
+  { id:"two-slice", label:"2D slice", expression:"s = x[:, ::2]", shape:[3,2], stride:[4,2], storageOffset:0, storageSize:12, layout:"STRIDED · 有洞", explanation:"列 stride 从 1 变成 2；view 没有 overlap，但中间 storage 元素未被使用。" },
+  { id:"three", label:"3D 连续", expression:"x = torch.arange(24).reshape(2, 3, 4)", shape:[2,3,4], stride:[12,4,1], storageOffset:0, storageSize:24, layout:"CONTIGUOUS", explanation:"连续 stride 从右向左计算：1、4、12。" },
+  { id:"permute", label:"3D permute", expression:"p = x.permute(2, 0, 1)", shape:[4,2,3], stride:[1,12,4], storageOffset:0, storageSize:24, layout:"DENSE PERMUTATION", explanation:"按新维度顺序同步重排 shape 与 stride，不复制 storage。" },
+  { id:"expand", label:"expand / stride=0", expression:"y = torch.tensor([[10], [20], [30]]).expand(3, 4)", shape:[3,4], stride:[1,0], storageOffset:0, storageSize:3, layout:"OVERLAPPING VIEW", explanation:"广播维 stride=0；同一行的 4 个逻辑坐标全部指向同一个物理元素。" },
+];
+
+const STRIDE_OPERATIONS = [
+  ["view", "是", "否；不兼容就报错", "只改 metadata；必须能用新 shape/stride 零拷贝表达"],
+  ["reshape / flatten", "可能", "可能静默复制", "能 view 就共享；transpose 后展平通常需要复制"],
+  ["transpose / .T", "是", "否", "交换两个维度的 shape 与 stride"],
+  ["permute / movedim", "是", "否", "按目标维度顺序重排 shape 与 stride"],
+  ["contiguous", "已连续时可能", "非连续时复制", "按逻辑坐标重排成目标 memory format 的连续 stride"],
+  ["clone", "否", "一定新 storage", "默认 preserve_format，可能保留 transpose 的非连续 stride"],
+  ["基础 slice / narrow / select", "是", "否", "改变 storage_offset、shape，步长 slice 还会放大对应 stride"],
+  ["tensor / list / bool 高级索引", "否", "是", "读取通常产生新 dense tensor；赋值仍写回原目标"],
+  ["index_put_", "目标不变", "否", "不改目标 stride，按目标逻辑 stride 原地写；重复 index 要考虑 accumulate"],
+  ["copy_", "目标不变", "否", "分别按 src stride 读、dst stride 写，不等同于 flat memcpy"],
+  ["unsqueeze / squeeze", "是", "否", "插入或删除 size=1 维；size=1 维的 stride 有自由度"],
+  ["expand", "是", "否", "广播维 stride 变 0，多个逻辑坐标 alias 同一物理地址"],
+  ["repeat / tile", "否", "是", "真正复制数据，结果通常是新的 dense layout"],
+  ["diagonal", "是", "否", "二维主对角线 stride 通常为 stride_row + stride_col"],
+  ["unfold", "是", "否", "新增窗口维并共享元素，常产生 overlapping view"],
+  ["as_strided", "是", "否", "手工指定 size/stride/offset；能造出洞、alias 或越界风险"],
+  ["flip", "通常否", "通常是", "PyTorch 通常复制，不应假设用负 stride 表示反向 view"],
+  ["cat / stack", "否", "是", "创建新输出，通常是 dense layout"],
+  ["detach", "是", "否", "只切断 autograd，shape/stride/storage 不变"],
+  ["to / cpu / dtype", "可能", "可能", "设备和 dtype 不变时可返回原 tensor，否则创建新 storage"],
+  ["pointwise / reduction / custom op", "看实现", "可能", "新 tensor 不保证标准 contiguous；必须检查实际输出 metadata"],
 ];
 
 const CASES = [
@@ -333,6 +381,61 @@ function TransferLab() {
   );
 }
 
+function unravelIndex(linear: number, shape: number[]) {
+  const coord = Array(shape.length).fill(0) as number[];
+  let rest = linear;
+  for (let axis = shape.length - 1; axis >= 0; axis--) {
+    coord[axis] = rest % shape[axis];
+    rest = Math.floor(rest / shape[axis]);
+  }
+  return coord;
+}
+
+function StrideLab() {
+  const [scenarioId, setScenarioId] = useState("transpose");
+  const [selectedLinear, setSelectedLinear] = useState(7);
+  const scenario = STRIDE_SCENARIOS.find((item) => item.id === scenarioId) ?? STRIDE_SCENARIOS[0];
+  const logicalCount = scenario.shape.reduce((product, size) => product * size, 1);
+  const cells = Array.from({ length: logicalCount }, (_, linear) => {
+    const coord = unravelIndex(linear, scenario.shape);
+    const offset = scenario.storageOffset + coord.reduce((sum, index, axis) => sum + index * scenario.stride[axis], 0);
+    return { linear, coord, offset };
+  });
+  const selected = cells[Math.min(selectedLinear, cells.length - 1)];
+  const selectedTerms = selected.coord.map((index, axis) => `${index}×${scenario.stride[axis]}`);
+  const aliases = cells.filter((cell) => cell.offset === selected.offset).length;
+  const usedOffsets = new Set(cells.map((cell) => cell.offset));
+
+  return <div className="stride-lab">
+    <div className="stride-scenario-tabs" aria-label="选择 stride 示例">{STRIDE_SCENARIOS.map((item) => <button key={item.id} className={item.id === scenario.id ? "active" : ""} onClick={() => { setScenarioId(item.id); setSelectedLinear(0); }}>{item.label}</button>)}</div>
+    <div className="stride-metadata">
+      <div><span>PYTORCH</span><code>{scenario.expression}</code></div>
+      <div><span>SHAPE</span><b>({scenario.shape.join(", ")})</b></div>
+      <div><span>STRIDE · elements</span><b>({scenario.stride.join(", ")})</b></div>
+      <div><span>STORAGE OFFSET</span><b>{scenario.storageOffset}</b></div>
+      <div><span>LAYOUT</span><b>{scenario.layout}</b></div>
+    </div>
+    <div className="stride-formula-band"><span>统一地址公式</span><code>element_offset = storage_offset + Σ index[d] × stride[d]</code><small>真正字节地址 = storage_base + element_offset × element_size()；stride 本身不是字节数。</small></div>
+    <div className="stride-map">
+      <div className="stride-logical">
+        <div className="stride-map-head"><span>LOGICAL TENSOR</span><small>点击任一逻辑坐标</small></div>
+        <div className="stride-logical-grid" style={{ "--stride-cols": scenario.shape.at(-1) } as CSSProperties}>{cells.map((cell) => <button key={cell.linear} className={cell.linear === selected.linear ? "selected" : ""} onClick={() => setSelectedLinear(cell.linear)}><small>[{cell.coord.join(",")}]</small><b>→ {cell.offset}</b></button>)}</div>
+      </div>
+      <div className="stride-address-arrow"><span>shape + stride</span><b>→</b><small>{scenario.explanation}</small></div>
+      <div className="stride-storage">
+        <div className="stride-map-head"><span>PHYSICAL STORAGE</span><small>底层永远是一维元素序列</small></div>
+        <div className="stride-storage-strip">{Array.from({ length: scenario.storageSize }, (_, offset) => <i key={offset} className={`${offset === selected.offset ? "selected" : ""} ${usedOffsets.has(offset) ? "used" : "hole"}`}><small>offset</small><b>{offset}</b></i>)}</div>
+      </div>
+    </div>
+    <div className="stride-derivation">
+      <div><span>当前逻辑坐标</span><b>[{selected.coord.join(", ")}]</b></div>
+      <div><span>代入公式</span><code>{scenario.storageOffset} + {selectedTerms.join(" + ")}</code></div>
+      <div><span>物理元素位置</span><b>storage[{selected.offset}]</b></div>
+      <div><span>地址别名</span><b>{aliases > 1 ? `${aliases} 个逻辑坐标共用` : "唯一物理元素"}</b></div>
+    </div>
+  </div>;
+}
+
 function ParallelLab() {
   const [tasks, setTasks] = useState(11);
   const [cores, setCores] = useState(4);
@@ -556,6 +659,57 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         <section id="transfer" className="wide-section dark-section">
           <div className="section-head light"><span>03 / DATA MOVEMENT</span><h2>切换 1D / 2D / 3D，看每个 block 怎样搬。</h2><p>逐轴设定 shape、BLOCK_SIZE 与 program_id，观察 X、Y 从 GM 进入 UB、并行相加并把 C 写回 GM 的完整生命周期。</p></div>
           <TransferLab />
+        </section>
+
+        <section id="stride" className="stride-section">
+          <div className="section-head"><span>03B / STRIDE &amp; MEMORY LAYOUT</span><h2>Shape 说“有几格”，stride 决定“下一格在哪”。</h2><p>stride 是某一维索引增加 1 时，在底层 storage 中跨过的元素数量。它不是字节数；只有再乘 <code>element_size()</code> 才得到字节距离。</p></div>
+          <div className="stride-foundation">
+            <article><span>01</span><b>storage</b><p>真正保存数据的一维物理元素序列；多个 Tensor view 可以共享它。</p></article>
+            <article><span>02</span><b>storage_offset</b><p>当前 view 的逻辑原点位于 storage 的第几个元素；slice 常改变它。</p></article>
+            <article><span>03</span><b>shape</b><p>每个逻辑维度有多长。shape 相同不代表物理布局相同。</p></article>
+            <article><span>04</span><b>stride</b><p>每个逻辑维度前进一步要跨多少个 storage 元素，决定坐标到地址的映射。</p></article>
+          </div>
+          <p className="stride-four-tuple"><code>Tensor 的逻辑解释 = storage + storage_offset + shape + stride</code><span>只检查 shape，无法识别 transpose、带洞 slice、stride=0 alias 或 memory format 的差异。</span></p>
+          <div className="stride-dimension-rules">
+            <article><span>1D</span><code>shape=(N) → stride=(1)</code><p>连续向量：<code>offset(i)=i</code>。若 <code>x[1::2]</code>，则 offset=1、stride=(2)。</p></article>
+            <article><span>2D</span><code>shape=(M,N) → stride=(N,1)</code><p><code>offset(row,col)=row×stride₀+col×stride₁</code>。transpose 只交换 shape/stride。</p></article>
+            <article><span>3D</span><code>shape=(D₀,D₁,D₂) → (D₁×D₂,D₂,1)</code><p>从右向左：<code>stride[-1]=1</code>，<code>stride[i]=shape[i+1]×stride[i+1]</code>。</p></article>
+          </div>
+          <StrideLab />
+          <div className="stride-layout-kinds">
+            <article><b>标准 contiguous</b><code>(3,4) / (4,1)</code><p>逻辑行优先顺序就是物理顺序；<code>is_contiguous() == True</code>。</p></article>
+            <article><b>Dense permutation</b><code>(4,3) / (1,4)</code><p>transpose 没有洞、没有重叠，但维度物理顺序变了；标准 contiguous 为 False。</p></article>
+            <article><b>带洞 strided view</b><code>(3,2) / (4,2)</code><p><code>x[:,::2]</code> 没有 overlap，但最小步长已经大于 1，部分 storage 未使用。</p></article>
+            <article><b>Overlapping view</b><code>(3,4) / (1,0)</code><p><code>expand</code> 的多个逻辑位置映射到同一物理元素，原地并行写可能发生冲突。</p></article>
+            <article><b>Channels-last</b><code>NCHW shape / NHWC-like stride</code><p>逻辑 shape 仍是 NCHW，但物理 stride 不同；用 <code>is_contiguous(memory_format=torch.channels_last)</code> 单独判断。</p></article>
+          </div>
+          <h3 className="subhead">常见 PyTorch 操作怎样改变 stride</h3>
+          <div className="table-wrap stride-operation-table"><table><thead><tr><th>操作</th><th>共享原 storage</th><th>是否复制</th><th>对 stride / 地址语义的影响</th></tr></thead><tbody>{STRIDE_OPERATIONS.map((row) => <tr key={row[0]}><td><code>{row[0]}</code></td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td></tr>)}</tbody></table></div>
+          <div className="stride-critical-diffs">
+            <article><span>VIEW vs RESHAPE</span><b><code>view</code> 不会偷偷复制；<code>reshape</code> 可能会。</b><p>transpose 后 <code>view(-1)</code> 通常报错，而 <code>reshape(-1)</code> 会在无法零拷贝时先复制。</p></article>
+            <article><span>CLONE vs CONTIGUOUS</span><b>新 storage 不等于标准连续。</b><p><code>clone()</code> 默认 preserve_format，可能保留 <code>(1,4)</code>；<code>contiguous()</code> 才按逻辑坐标重排成 <code>(3,1)</code>。</p></article>
+            <article><span>EXPAND vs REPEAT</span><b><code>expand</code> 用 stride=0 alias；<code>repeat</code> 真复制。</b><p>前者省内存但多个逻辑坐标共用元素，后者占用新 storage、每个元素独立。</p></article>
+          </div>
+          <div className="stride-abi-warning">
+            <span>CUSTOM KERNEL ABI</span><h3>不要看到非连续 Tensor 就一律 contiguous，也不要一律按 stride 写。</h3>
+            <p>先确认生产者和消费者约定的是哪种语义：若 Triton / PyTorch 算子接收并使用每一维 stride，应保持“原 view pointer + 原 view stride”配套；若下游自定义 NPU op 只接收裸 <code>data_ptr()</code>、完全不接收 stride，它消费的是物理 flat ABI，此时按 transpose view 的 stride 写会额外做一次物理转置。shape 恰好对称（例如 128×128）时，shape 检查抓不到这种错误。</p>
+                <code>逻辑 Tensor contract → 尊重 stride | 裸指针物理 ABI → 保持约定的 flat storage layout</code>
+          </div>
+          <div className="stride-inspector">
+            <div><h3>用这组属性判断，不要根据函数名猜。</h3><CodeBlock>{`def tensor_info(name, x):
+    print(name)
+    print("shape         =", tuple(x.shape))
+    print("stride        =", tuple(x.stride()))
+    print("storage_offset=", x.storage_offset())
+    print("element_size  =", x.element_size())
+    print("is_contiguous =", x.is_contiguous())
+    print("data_ptr      =", x.data_ptr())
+    print("storage_ptr   =", x.untyped_storage().data_ptr())
+
+def shares_storage(a, b):
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()`}</CodeBlock></div>
+            <ol><li><b>先看 shape + stride + storage_offset</b><span>同 shape 仍可能是 transpose、channels-last、带洞或 overlapping view。</span></li><li><b>再看是否共享 storage</b><span><code>data_ptr</code> 受 offset 影响；比较 <code>untyped_storage().data_ptr()</code> 判断底层 storage。</span></li><li><b>核对 pointer 与 stride 是否来自同一对象</b><span>不能把 contiguous copy 的新 pointer 与原 view 的旧 stride 混用。</span></li><li><b>最后核对消费者 ABI</b><span>自定义 kernel 是否真的接收 stride？若没有，它只会按约定的物理布局解释裸指针。</span></li></ol>
+          </div>
         </section>
 
         <section id="parallel">
