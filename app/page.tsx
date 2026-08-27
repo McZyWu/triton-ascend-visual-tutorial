@@ -730,7 +730,7 @@ def shares_storage(a, b):
         </section>
 
         <section id="cases" className="cases-section">
-          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>这里选算子，在全屏实验室逐个跑。</h2><p>覆盖当前主分支 47 个含 Triton 的 Python 模块、{TOTAL_TRITON_KERNELS} 个 JIT kernel。点击“全屏详细模拟”，在新窗口逐变量检查 Grid、program、Block lane、GM 地址、load、UB、计算和 store。</p><a className="cases-launch" href="/kernel-lab" target="_blank" rel="noreferrer">新窗口打开 Production Kernel Lab <b>↗</b></a></div>
+          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>这里选算子，在全屏实验室逐个跑。</h2><p>覆盖当前主分支 {KERNEL_OPS.length} 个含 Triton 的 Python 模块、{TOTAL_TRITON_KERNELS} 个 JIT kernel。点击“全屏详细模拟”，在新窗口逐变量检查 Grid、program、Block lane、GM 地址、load、UB、计算和 store。</p><a className="cases-launch" href="/kernel-lab" target="_blank" rel="noreferrer">新窗口打开 Production Kernel Lab <b>↗</b></a></div>
           <h3 className="subhead">4 个代表性算子的输入输出速查</h3>
           <div className="case-list">{CASES.map((item) => <article key={item.id}>
             <div className="case-title"><span>{item.no}</span><h3>{item.name}</h3><a href={item.source} target="_blank" rel="noreferrer">源码 ↗</a></div>

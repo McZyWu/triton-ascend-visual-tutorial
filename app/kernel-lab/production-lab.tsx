@@ -23,7 +23,7 @@ const PHASE_STEP: Record<SourcePhase, number> = { program:1, offset:2, load:3, c
 const PHASE_TEXT: Record<SourcePhase, string> = { program:"PROGRAM / TASK", offset:"OFFSET / MASK", load:"GM → UB", compute:"UB COMPUTE", store:"UB → GM" };
 
 type ArgMeaning = { meaning: string; shape: string; caller: string };
-type LabProfile = { labels: string[]; shape: number[]; block: number[]; persistent: boolean; programCap?: number };
+type LabProfile = { labels: string[]; shape: number[]; block: number[]; persistent: boolean; persistentMode?: "strided" | "contiguous"; programCap?: number };
 type UbItem = { name: string; source: string; formula: string; elements: number; bytesPerElement: number; bytes: number; phase: "load" | "compute" };
 
 const EXACT_ARG_MEANINGS: Record<string, Partial<ArgMeaning>> = {
@@ -75,6 +75,26 @@ const EXACT_ARG_MEANINGS: Record<string, Partial<ArgMeaning>> = {
   sin_ptr: { meaning:"当前 position 对应的 RoPE sin", shape:"[tokens, rope_dim] 或可广播 cache", caller:"rotary embedding 生成的 position_sin" },
   cos_ptr: { meaning:"当前 position 对应的 RoPE cos", shape:"[tokens, rope_dim] 或可广播 cache", caller:"rotary embedding 生成的 position_cos" },
   cos_sin_cache_ptr: { meaning:"按 position 索引的半宽 RoPE cos/sin cache", shape:"[max_seq_len, rope_dim]", caller:"rotary embedding 的全局 position cache" },
+  in_qkv_ptr: { meaning:"融合投影产生的 Q、可选 gate、K、V 连续输入", shape:"[tokens, q_size + gate_size + 2 × kv_size]", caller:"Qwen3-VL / 多模态 attention 的融合 QKV 投影输出 qkv" },
+  cos_sin_ptr: { meaning:"temporal、height、width 三套 MRoPE cos/sin 表；每套最后一维前半是 cos、后半是 sin", shape:"[3, num_tokens, rope_dim]", caller:"多模态 rotary embedding 根据文本/高/宽 position ids 生成的 cos_sin" },
+  out_q_ptr: { meaning:"完成分 head RMSNorm 与 MRoPE 后的 Query", shape:"[tokens, num_q_heads × head_size]", caller:"attention 计算使用的 q_output" },
+  out_k_ptr: { meaning:"完成分 head RMSNorm 与 MRoPE 后的 Key", shape:"[tokens, num_kv_heads × head_size]", caller:"attention / KV cache 使用的 k_output" },
+  out_v_ptr: { meaning:"从融合输入拆出的 Value；不做 RMSNorm 或 MRoPE", shape:"[tokens, num_kv_heads × head_size]", caller:"attention / KV cache 使用的 v_output" },
+  out_gate_ptr: { meaning:"融合输入中可选的 Q gate 分支", shape:"[tokens, num_q_heads × head_size]；无 gate 时末维为 0", caller:"启用 gated attention 时返回的 gate_output" },
+  predicts: { meaning:"最终被接受或重新采样的 token 写入位置", shape:"[num_prediction_slots]", caller:"speculative decoding 的输出 token buffer" },
+  candidates: { meaning:"draft 模型提出的候选 token id；chain 按列前进，tree 按 child/sibling 索引遍历", shape:"[batch, num_draft_tokens]", caller:"speculative decoding draft candidates" },
+  retrive_index: { meaning:"每个候选节点对应的输出/隐藏状态槽位索引", shape:"[batch, num_draft_tokens]", caller:"draft tree/chain 的 retrieve index（沿用上游拼写 retrive）" },
+  retrive_next_token: { meaning:"tree 中当前节点第一个 child 的节点下标；-1 表示没有 child", shape:"[batch, num_draft_tokens]", caller:"tree speculative decoding 的 child 链" },
+  retrive_next_sibling: { meaning:"tree 中当前节点下一个 sibling 的节点下标；-1 表示 sibling 链结束", shape:"[batch, num_draft_tokens]", caller:"tree speculative decoding 的 sibling 链" },
+  uniform_samples: { meaning:"每个 draft 节点用于接受/拒绝判断的 [0,1) 随机数", shape:"[batch, num_draft_tokens]", caller:"采样器预生成的 acceptance uniforms" },
+  uniform_samples_for_final_sampling: { meaning:"拒绝后从 residual 分布抽最终 token 的每请求随机数", shape:"[batch]", caller:"采样器预生成的 final-sampling uniforms" },
+  target_probs: { meaning:"target 模型在每个 draft/tree 行上的完整词表概率", shape:"[batch, num_draft_tokens, vocab_size]", caller:"target logits softmax 后的概率" },
+  draft_probs: { meaning:"chain 中是 draft 模型词表概率；target-only tree 中复用为 rejected probability scratch", shape:"[batch, draft_rows, vocab_size]", caller:"draft probability 或 zeros_like(target_probs) scratch" },
+  rejected_probs: { meaning:"target-only tree 中记录被拒绝 sibling 的 target probability", shape:"[batch, num_draft_tokens, vocab_size]", caller:"wrapper 传入并先清零的 draft_probs scratch" },
+  metadata: { meaning:"跨三次 kernel launch 传递的每请求小型状态：概率行、输出槽以及是否全部接受", shape:"chain=[batch,3]；target-only tree=[batch,2]", caller:"speculative sampling wrapper 内部分配的 int64 metadata" },
+  block_sums: { meaning:"每个请求、每个 2048-token 词表块的 residual probability 总和", shape:"[batch, ceil(vocab_size/2048)]", caller:"wrapper 内部分配，供最终两级 CDF 采样" },
+  accept_index: { meaning:"按接受顺序记录被保留的 draft/retrieve 槽位", shape:"chain=[batch,num_draft_tokens]；tree=[batch,max_tree_depth]", caller:"speculative decoding 输出的 accepted indices" },
+  accept_token_num: { meaning:"每个请求实际接受的 draft token 数量", shape:"[batch]", caller:"speculative decoding 输出的 accepted count" },
 };
 
 function outputArg(name: string) {
@@ -156,9 +176,15 @@ function meaningFromName(name: string, kind: ArgKind, op: KernelOp, callerExpres
   };
 }
 
-function profileFor(op: KernelOp): LabProfile {
+function profileFor(op: KernelOp, kernel = op.kernels[0]): LabProfile {
   const persistent = /persistent/i.test(op.grid);
   if (op.id === "muladd") return { labels:["batch_rows","unused grid axis","hidden_size"], shape:[48,1,4096], block:[1,1,4096], persistent:true, programCap:40 };
+  if (op.id === "qkvmrope") return { labels:["token / core task","Q/K head","head lane"], shape:[12,4,128], block:[1,4,128], persistent:true, persistentMode:"contiguous", programCap:8 };
+  if (op.id === "chain_sample" || op.id === "tree_target") {
+    if (kernel.includes("block_sum")) return { labels:["request","vocab token","scalar"], shape:[4,4096,1], block:[1,2048,1], persistent:true, programCap:4 };
+    if (kernel.includes("sample_kernel")) return { labels:["request","vocab block sums","selected block lane"], shape:[4,2,2048], block:[1,2,2048], persistent:false };
+    return { labels:["request","draft / tree step","scalar"], shape:[4,6,1], block:[1,6,1], persistent:false };
+  }
   if (op.group === "Attention" || op.group === "Indexer") return { labels:["batch / Q-block","head / chunk","D / page lane"], shape:[4,6,16], block:[1,2,8], persistent };
   if (op.group === "FLA / KDA") return { labels:["sequence / chunk","head","K/V lane"], shape:[8,4,16], block:[1,1,8], persistent };
   if (op.group === "Mamba / Cache") return { labels:["request / layer","channel block","window / tail"], shape:[8,8,8], block:[1,2,4], persistent };
@@ -268,6 +294,18 @@ function unflattenTask(task: number, grid: number[]) {
   return [Math.floor(task / (grid[1] * grid[2])), Math.floor(task / grid[2]) % grid[1], task % grid[2]];
 }
 
+function persistentTask(program: number, round: number, totalTasks: number, programs: number, mode: "strided" | "contiguous" = "strided") {
+  if (mode === "strided") {
+    const task = program + round * programs;
+    return task < totalTasks ? task : null;
+  }
+  const base = Math.floor(totalTasks / programs);
+  const extra = totalTasks % programs;
+  const count = base + (program < extra ? 1 : 0);
+  const start = program < extra ? program * (base + 1) : extra * (base + 1) + (program - extra) * base;
+  return round < count ? start + round : null;
+}
+
 function KernelProductionLab() {
   const params = useSearchParams();
   const initialId = params.get("op") || KERNEL_OPS[0].id;
@@ -280,8 +318,8 @@ function KernelProductionLab() {
   const [playing, setPlaying] = useState(false);
   const [round, setRound] = useState(0);
   const selected = KERNEL_OPS.find(x => x.id === selectedId) ?? KERNEL_OPS[0];
-  const [shape, setShape] = useState(() => profileFor(selected).shape);
-  const [block, setBlock] = useState(() => profileFor(selected).block);
+  const [shape, setShape] = useState(() => profileFor(selected, selected.kernels[Math.min(kernelIndex, selected.kernels.length - 1)]).shape);
+  const [block, setBlock] = useState(() => profileFor(selected, selected.kernels[Math.min(kernelIndex, selected.kernels.length - 1)]).block);
   const [pid, setPid] = useState([0,0,0]);
   const [variable, setVariable] = useState("");
   const [segmentId, setSegmentId] = useState("");
@@ -292,7 +330,7 @@ function KernelProductionLab() {
   const sourceSegments = sourceModule.module === selected.module ? sourceModule.kernels[kernel] ?? [] : [];
   const activeSegment = sourceSegments.find(item => item.id === segmentId);
   const args = useMemo(() => signature?.args ?? [], [signature]);
-  const profile = profileFor(selected);
+  const profile = profileFor(selected, kernel);
 
   useEffect(() => {
     if (!playing) return;
@@ -322,9 +360,10 @@ function KernelProductionLab() {
   const maxRound = persistentRounds - 1;
   const directFlatPid = (pid[0] * grid[1] + pid[1]) * grid[2] + pid[2];
   const physicalPid = profile.persistent ? pid[0] : directFlatPid;
-  const task = profile.persistent ? physicalPid + round * physicalPrograms : directFlatPid;
-  const taskIsValid = task < logicalTasks;
-  const taskPid = profile.persistent ? unflattenTask(task, grid) : pid;
+  const assignedPersistentTask = profile.persistent ? persistentTask(physicalPid, round, logicalTasks, physicalPrograms, profile.persistentMode) : null;
+  const task = profile.persistent ? assignedPersistentTask ?? logicalTasks : directFlatPid;
+  const taskIsValid = profile.persistent ? assignedPersistentTask !== null : task < logicalTasks;
+  const taskPid = profile.persistent ? taskIsValid ? unflattenTask(task, grid) : [0,0,0] : pid;
   const tileElements = block[0] * block[1] * block[2];
   const shownLanes = Math.min(32, tileElements);
   const coords: Coord[] = Array.from({ length: shownLanes }, (_, lane) => {
@@ -342,7 +381,7 @@ function KernelProductionLab() {
   const visible = KERNEL_OPS.filter(op => (group === "全部" || op.group === group) && `${op.title} ${op.module} ${op.kernels.join(" ")}`.toLowerCase().includes(query.toLowerCase()));
 
   const chooseOp = (op: KernelOp) => {
-    const p = profileFor(op);
+    const p = profileFor(op, op.kernels[0]);
     setSelectedId(op.id); setKernelIndex(0); setShape(p.shape); setBlock(p.block); setPid([0,0,0]); setRound(0); setStep(0); setPlaying(false); setVariable(""); setSegmentId("");
     window.history.replaceState(null, "", `/kernel-lab?op=${encodeURIComponent(op.id)}`);
   };
@@ -379,7 +418,7 @@ function KernelProductionLab() {
         <div className="pl-title-actions"><a href={sourceUrl} target="_blank" rel="noreferrer">在 GitHub 打开该 kernel ↗</a><a href={`${VISUAL_SOURCE.repository}/commit/${VISUAL_SOURCE.commit}`} target="_blank" rel="noreferrer">可视化截止 commit {VISUAL_SOURCE.shortCommit} ↗</a><code>{profile.persistent ? "PERSISTENT GRID" : "DIRECT GRID"}</code></div>
       </section>
 
-      <section className="pl-kernel-picker"><b>本模块 JIT kernel</b>{selected.kernels.map((name,i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { setKernelIndex(i); setStep(0); setVariable(""); setSegmentId(""); window.history.replaceState(null,"",`/kernel-lab?op=${selected.id}&kernel=${encodeURIComponent(name)}`); }}>{name}</button>)}</section>
+      <section className="pl-kernel-picker"><b>本模块 JIT kernel</b>{selected.kernels.map((name,i) => <button key={name} className={i === kernelIndex ? "active" : ""} onClick={() => { const p = profileFor(selected, name); setKernelIndex(i); setShape(p.shape); setBlock(p.block); setPid([0,0,0]); setRound(0); setStep(0); setVariable(""); setSegmentId(""); window.history.replaceState(null,"",`/kernel-lab?op=${selected.id}&kernel=${encodeURIComponent(name)}`); }}>{name}</button>)}</section>
 
       <section className="pl-signature"><span>SOURCE SIGNATURE · line {signature?.line ?? "?"} · {sourceSegments.length} executable statements · commit {VISUAL_SOURCE.shortCommit}</span><code>def {kernel}({args.join(", ")})</code><p>变量清单来自该 <code>@triton.jit</code> 签名；下方每一段可执行源码都可点击，并会跳到对应的 Grid / Offset / Load / Compute / Store 可视化阶段。</p></section>
 
@@ -394,19 +433,19 @@ function KernelProductionLab() {
       <section className="pl-step-summary"><div><span>当前阶段</span><strong>{STEPS[step][1]}</strong></div><p>{activeSegment?.explanation ?? [selected.grid, `program ${taskPid.join(",")} 正在处理 task ${task}`, `lane → local → global → flat offset；尾块由 mask 保护`, selected.load, `${selected.tile}；当前片上工作集 ${(ub.peakBytes/1024).toFixed(2)} KiB`, selected.compute, selected.store, selected.torch][step]}</p></section>
 
       <section className={`pl-grid-panel ${step <= 1 ? "focus" : ""}`}>
-        <header><div><span>GRID / PROGRAM MAP</span><h2>Grid 怎样拆成并行 task</h2></div><p>{profile.persistent ? <><code>task = pid + k × P</code>；P={physicalPrograms}，当前 k={round}，所以 task={physicalPid}+{round}×{physicalPrograms}={task}。</> : <>每个 program 直接领取一个逻辑 tile；program 坐标乘 BLOCK 得到 tile 起点。</>}</p></header>
+        <header><div><span>GRID / PROGRAM MAP</span><h2>Grid 怎样拆成并行 task</h2></div><p>{profile.persistent ? profile.persistentMode === "contiguous" ? <><code>每个 pid 连续领取一段 task</code>；前 {logicalTasks % physicalPrograms || physicalPrograms} 个 program 每个处理 {Math.ceil(logicalTasks / physicalPrograms)} 个 task，其余处理 {Math.floor(logicalTasks / physicalPrograms)} 个；P{physicalPid} 当前 k={round} → {taskIsValid ? `task ${task}` : "idle"}。</> : <><code>task = pid + k × P</code>；P={physicalPrograms}，当前 k={round}，所以 task={physicalPid}+{round}×{physicalPrograms}={task}。</> : <>每个 program 直接领取一个逻辑 tile；program 坐标乘 BLOCK 得到 tile 起点。</>}</p></header>
         {profile.persistent && <div className="pl-round">
           <label htmlFor="persistent-round">persistent 轮次 k</label>
           <button type="button" onClick={() => setRound(current => Math.max(0, current - 1))} disabled={round === 0} aria-label="上一轮">−</button>
           <input id="persistent-round" type="range" min={0} max={maxRound} step={1} value={round} onInput={e => setRound(Number(e.currentTarget.value))} onChange={e => setRound(Number(e.currentTarget.value))} aria-label="persistent 轮次 k" data-round-max={maxRound} />
           <button type="button" onClick={() => setRound(current => Math.min(maxRound, current + 1))} disabled={round === maxRound} aria-label="下一轮">+</button>
           <output htmlFor="persistent-round">k = <b>{round}</b> / {maxRound}</output>
-          <span>共 {persistentRounds} 轮；可拖动滑块、点 ± 或用方向键。第 {round} 轮只有 task &lt; {logicalTasks} 的 program 工作。</span>
+          <span>共 {persistentRounds} 轮；可拖动滑块、点 ± 或用方向键。第 {round} 轮只有仍分配到 task 的 program 工作。</span>
         </div>}
         <div className="pl-program-map">{displayPrograms.map(item => {
-          const assignedTask = item.flat + round * physicalPrograms;
-          const assignedPid = unflattenTask(assignedTask, grid);
-          const idle = profile.persistent && assignedTask >= logicalTasks;
+          const assignedTask = profile.persistent ? persistentTask(item.flat, round, logicalTasks, physicalPrograms, profile.persistentMode) : directFlatPid;
+          const assignedPid = unflattenTask(assignedTask ?? 0, grid);
+          const idle = profile.persistent && assignedTask === null;
           return <button key={item.flat} className={`${profile.persistent ? physicalPid === item.flat ? "active" : "" : pid.every((x,i)=>x===item.p[i]) ? "active" : ""} ${idle ? "idle" : ""}`} onClick={() => !idle && setPid(item.p)} disabled={idle}><b>P{item.flat}</b><span>{profile.persistent ? idle ? "idle" : `task ${assignedTask}` : `[${item.p.join(",")}]`}</span><small>{idle ? "本轮没有剩余 task" : `origin [${(profile.persistent ? assignedPid : item.p).map((x,i)=>x*block[i]).join(",")}]`}</small></button>;
         })}</div>
         {!profile.persistent && logicalTasks > 48 && <p className="pl-clipped">只绘制前 48 个 program；完整 Grid 共 {logicalTasks} 个，计算规则相同。</p>}

@@ -20,7 +20,8 @@ test("server-renders the Triton Ascend tutorial", async () => {
   assert.match(html, /Triton Ascend Visual Lab/);
   assert.match(html, /06 \/ PRODUCTION CASES/);
   assert.match(html, /\/kernel-lab/);
-  assert.match(html, /84<!-- --> 个 JIT kernel|84 个 JIT kernel/);
+  assert.match(html, /91<!-- --> 个 JIT kernel|91 个 JIT kernel/);
+  assert.match(html, /50<!-- --> 个含 Triton 的 Python 模块|50 个含 Triton 的 Python 模块/);
   assert.match(html, /Tile 是工作块，lane 是块内位置/);
   assert.match(html, /lane 3/);
   assert.match(html, /lane 5/);
@@ -60,8 +61,33 @@ test("server-renders the full production kernel lab", async () => {
   assert.match(html, /每个变量是什么、什么 shape、从模型哪里传入/);
   assert.match(html, /GM → UB \/ REG → GM/);
   assert.match(html, /SOURCE → VISUAL STAGE/);
-  assert.match(html, /2a87cda/);
+  assert.match(html, /5a1189f/);
   assert.doesNotMatch(html, /基址不等于元素地址/);
+});
+
+test("renders latest MRoPE and speculative sampling simulations", async () => {
+  const mropeResponse = await render("/kernel-lab?op=qkvmrope");
+  assert.equal(mropeResponse.status, 200);
+  const mrope = await mropeResponse.text();
+  assert.match(mrope, /Split QKV \+ RMSNorm \+ Multimodal RoPE/);
+  assert.match(mrope, /split_qkv_rmsnorm_mrope_kernel/);
+  assert.match(mrope, /每个 pid 连续领取一段 task/);
+  assert.match(mrope, /temporal、height、width/);
+  assert.match(mrope, /5a1189f/);
+
+  const chainResponse = await render("/kernel-lab?op=chain_sample&kernel=_chain_rejection_block_sum_kernel");
+  assert.equal(chainResponse.status, 200);
+  const chain = await chainResponse.text();
+  assert.match(chain, /Chain Speculative Rejection Sampling/);
+  assert.match(chain, /_chain_rejection_block_sum_kernel/);
+  assert.match(chain, /vocab token/);
+  assert.match(chain, /data-round-max="1"/);
+
+  const treeResponse = await render("/kernel-lab?op=tree_target");
+  assert.equal(treeResponse.status, 200);
+  const tree = await treeResponse.text();
+  assert.match(tree, /Tree Speculative Sampling · Target Only/);
+  assert.match(tree, /_tree_target_only_accept_kernel/);
 });
 
 test("mul-add exposes both draggable persistent rounds", async () => {

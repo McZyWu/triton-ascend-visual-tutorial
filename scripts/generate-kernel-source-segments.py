@@ -159,7 +159,8 @@ def arange_and_assignments(statements: list[tuple[int, int, str]]):
 
 
 def tile_formula(code: str, aranges: dict[str, str], assignments: dict[str, str]) -> str:
-    frontier = list(identifiers(code))
+    # Keep generated formulas byte-for-byte stable across Python hash seeds.
+    frontier = sorted(identifiers(code), reverse=True)
     visited: set[str] = set()
     extents: list[str] = []
     while frontier:
@@ -171,7 +172,7 @@ def tile_formula(code: str, aranges: dict[str, str], assignments: dict[str, str]
             extents.append(aranges[name])
         rhs = assignments.get(name)
         if rhs:
-            frontier.extend(identifiers(rhs) - visited)
+            frontier.extend(sorted(identifiers(rhs) - visited, reverse=True))
     return " × ".join(extents) if extents else "1"
 
 
