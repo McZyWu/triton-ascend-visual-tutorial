@@ -1,91 +1,142 @@
 import assert from "node:assert/strict";
-import { access, readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
-const developmentPreviewMeta =
-  /<meta(?=[^>]*\bname=["']codex-preview["'])(?=[^>]*\bcontent=["']development["'])[^>]*>/i;
-const templateRoot = new URL("../", import.meta.url);
-const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
-
-async function render() {
+async function render(pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${pathname}`);
   const { default: worker } = await import(workerUrl.href);
-
   return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
+    new Request(`http://localhost${pathname}`, { headers: { accept: "text/html" } }),
+    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
+    { waitUntil() {}, passThroughOnException() {} },
   );
 }
 
-test("server-renders the starter loading skeleton", async () => {
-  const response = await render();
+test("server-renders the Triton Ascend tutorial", async () => {
+  const response = await render("/");
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
   const html = await response.text();
-  assert.match(html, developmentPreviewMeta);
-  assert.match(html, /<title>Your site is taking shape<\/title>/i);
-  assert.match(html, /Building your site/);
-  assert.match(html, /Your site is taking shape/);
-  assert.match(
-    html,
-    /Your first version will appear here automatically when it’s ready\./,
-  );
-  assert.doesNotMatch(html, /Codex/);
-  assert.match(html, /react-loading-skeleton/);
-  assert.match(html, /role="status"/);
+  assert.match(html, /Triton Ascend Visual Lab/);
+  assert.match(html, /06 \/ PRODUCTION CASES/);
+  assert.match(html, /\/kernel-lab/);
+  assert.match(html, /91<!-- --> 个 JIT kernel|91 个 JIT kernel/);
+  assert.match(html, /50<!-- --> 个含 Triton 的 Python 模块|50 个含 Triton 的 Python 模块/);
+  assert.match(html, /Tile 是工作块，lane 是块内位置/);
+  assert.match(html, /lane 3/);
+  assert.match(html, /lane 5/);
+  assert.match(html, /DATA MOVEMENT 播放与单步控制/);
+  const dataMovementStage = html.indexOf('class="memory-stage-v2"');
+  const dataMovementControls = html.indexOf('class="transfer-playback-controls"');
+  const dataMovementStep = html.indexOf('class="step-line"');
+  assert.ok(dataMovementStage >= 0 && dataMovementStage < dataMovementControls, "DATA MOVEMENT controls should follow the transfer visualization");
+  assert.ok(dataMovementControls < dataMovementStep, "DATA MOVEMENT controls should stay attached to the transfer visualization");
+  assert.match(html, /03B \/ STRIDE &amp; MEMORY LAYOUT/);
+  assert.ok(html.includes("Tensor 的逻辑解释 = storage + storage_offset + shape + stride"));
+  assert.ok(html.includes("element_offset = storage_offset + Σ index[d] × stride[d]"));
+  assert.match(html, /1D slice/);
+  assert.match(html, /2D transpose/);
+  assert.match(html, /3D permute/);
+  assert.match(html, /expand \/ stride=0/);
+  assert.match(html, /view size is not compatible|VIEW vs RESHAPE/);
+  assert.match(html, /CLONE vs CONTIGUOUS/);
+  assert.match(html, /CUSTOM KERNEL ABI/);
+  assert.match(html, /逻辑 Tensor contract → 尊重 stride/);
+  assert.match(html, /index_put_/);
+  assert.match(html, /as_strided/);
+  const strideSection = html.indexOf('id="stride"');
+  const parallelSection = html.indexOf('id="parallel"');
+  assert.ok(dataMovementControls < strideSection && strideSection < parallelSection, "stride tutorial should follow DATA MOVEMENT and precede Grid parallelism");
+  assert.doesNotMatch(html, /Your site is taking shape|codex-preview/);
 });
 
-test("keeps the loading skeleton scoped and disposable", async () => {
-  const [preview, css, page, layout, packageJson, files] = await Promise.all([
-    readFile(new URL("SkeletonPreview.tsx", previewRoot), "utf8"),
-    readFile(new URL("preview.css", previewRoot), "utf8"),
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../package.json", import.meta.url), "utf8"),
-    readdir(previewRoot),
-  ]);
+test("server-renders the full production kernel lab", async () => {
+  const response = await render("/kernel-lab?op=rms");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /Production Kernel Lab/);
+  assert.match(html, /GRID \/ PROGRAM MAP/);
+  assert.match(html, /BLOCK \/ LANE ADDRESSING/);
+  assert.match(html, /ALL KERNEL ARGUMENTS/);
+  assert.match(html, /每个变量是什么、什么 shape、从模型哪里传入/);
+  assert.match(html, /GM → UB \/ REG → GM/);
+  assert.match(html, /SOURCE → VISUAL STAGE/);
+  assert.match(html, /5a1189f/);
+  assert.doesNotMatch(html, /基址不等于元素地址/);
+});
 
-  assert.deepEqual(files.sort(), ["SkeletonPreview.tsx", "preview.css"]);
-  assert.match(preview, /from "react-loading-skeleton"/);
-  assert.match(preview, /baseColor="#eceae7"/);
-  assert.match(preview, /highlightColor="#f9f8f6"/);
-  assert.match(preview, /duration=\{2\.8\}/);
-  assert.match(preview, /sites-skeleton-search-placeholder/);
-  assert.match(packageJson, /"react-loading-skeleton": "3\.5\.0"/);
+test("renders latest MRoPE and speculative sampling simulations", async () => {
+  const mropeResponse = await render("/kernel-lab?op=qkvmrope");
+  assert.equal(mropeResponse.status, 200);
+  const mrope = await mropeResponse.text();
+  assert.match(mrope, /Split QKV \+ RMSNorm \+ Multimodal RoPE/);
+  assert.match(mrope, /split_qkv_rmsnorm_mrope_kernel/);
+  assert.match(mrope, /每个 pid 连续领取一段 task/);
+  assert.match(mrope, /temporal、height、width/);
+  assert.match(mrope, /5a1189f/);
 
-  const shellIndex = preview.indexOf('className="sites-skeleton-shell"');
-  const statusIndex = preview.indexOf('className="sites-skeleton-status"');
-  assert.ok(shellIndex >= 0 && statusIndex > shellIndex);
-  assert.match(css, /position:\s*fixed/);
-  assert.match(css, /inset:\s*0/);
-  assert.match(css, /opacity:\s*0\.52/);
-  assert.match(css, /prefers-reduced-motion:\s*reduce/);
-  assert.doesNotMatch(css, /#020617|canvas|pets|progress/i);
-  assert.doesNotMatch(
-    preview,
-    /loading-spinner|status-mark|status-progress|canvas|cookie|random/i,
-  );
+  const chainResponse = await render("/kernel-lab?op=chain_sample&kernel=_chain_rejection_block_sum_kernel");
+  assert.equal(chainResponse.status, 200);
+  const chain = await chainResponse.text();
+  assert.match(chain, /Chain Speculative Rejection Sampling/);
+  assert.match(chain, /_chain_rejection_block_sum_kernel/);
+  assert.match(chain, /vocab token/);
+  assert.match(chain, /data-round-max="1"/);
 
-  assert.match(page, /export const metadata:\s*Metadata/);
-  assert.match(page, /"codex-preview": "development"/);
-  assert.match(page, /<SkeletonPreview \/>/);
-  assert.match(layout, /title:\s*"Starter Project"/);
-  assert.doesNotMatch(layout, /codex-preview|_sites-preview|themeColor|\bViewport\b/);
-  assert.doesNotMatch(css, /(^|\s)(html|body)\s*\{/m);
+  const treeResponse = await render("/kernel-lab?op=tree_target");
+  assert.equal(treeResponse.status, 200);
+  const tree = await treeResponse.text();
+  assert.match(tree, /Tree Speculative Sampling · Target Only/);
+  assert.match(tree, /_tree_target_only_accept_kernel/);
+});
 
-  await assert.rejects(
-    access(new URL("public/_sites-preview", templateRoot)),
-  );
+test("mul-add exposes both draggable persistent rounds", async () => {
+  const response = await render("/kernel-lab?op=muladd");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /MoE Mul‑Add/);
+  assert.match(html, /persistent 轮次 k/);
+  assert.match(html, /data-round-max="1"/);
+  assert.match(html, /共 (?:<!-- -->)?2(?:<!-- -->)? 轮/);
+  assert.match(html, /可拖动滑块、点 ± 或用方向键/);
+  assert.match(html, /搬运播放与单步控制/);
+  assert.match(html, /播放搬运/);
+  assert.match(html, /单步后退/);
+  assert.match(html, /单步前进/);
+  const memoryFlow = html.indexOf('class="pl-memory-flow"');
+  const playbackControls = html.indexOf('class="pl-memory-controls"');
+  const ubLedger = html.indexOf('class="pl-ub-ledger"');
+  assert.ok(memoryFlow >= 0 && memoryFlow < playbackControls, "playback controls should follow the transfer visualization");
+  assert.ok(playbackControls < ubLedger, "playback controls should remain attached to the transfer visualization");
+});
+
+test("server-renders the profiling evidence page", async () => {
+  const response = await render("/profiling");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /ASCEND PROFILING FIELD GUIDE/);
+  assert.match(html, /00 \/ MEMORY TERMINOLOGY/);
+  assert.match(html, /GM 是仓库，UB 是当前核的工作台/);
+  assert.match(html, /每轮最低 GM 流量/);
+  assert.match(html, /真实 UB 峰值/);
+  assert.match(html, /MTE2\/MTE3 告诉你“搬运流水运行了多久”/);
+  assert.match(html, /mul_add_kernel/);
+  assert.match(html, /2a87cda/);
+  assert.match(html, /32 KiB/);
+  assert.match(html, /MTE2/);
+  assert.match(html, /kernel_details\.csv/);
+  assert.match(html, /chrome:\/\/tracing\//);
+  assert.match(html, /mul-add-trace-view\.json/);
+  assert.match(html, /01 \/ SINGLE OP CAPTURE/);
+  assert.match(html, /02 \/ PIPELINE &amp; TRACE\.JSON/);
+  assert.match(html, /03 \/ HOTSPOT/);
+  assert.match(html, /04 \/ BOUND/);
+  assert.match(html, /05 \/ OPTIMIZE/);
+  assert.match(html, /06 \/ RESULTS &amp; BENEFIT/);
+  assert.match(html, /_situ_deepep_kernel_0/);
+  assert.match(html, /split_qkv_rmsnorm_rope_kernel_0/);
+  assert.match(html, /Start Time\(us\)/);
+  assert.match(html, /aiv_mte2_time \/ ratio/);
+  assert.match(html, /k3-qwen-trace-extract\.json/);
+  assert.match(html, /不同 shape 不计算 speedup/);
 });

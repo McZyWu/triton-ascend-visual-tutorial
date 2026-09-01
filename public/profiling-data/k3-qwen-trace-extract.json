@@ -1,0 +1,21 @@
+{
+  "traceEvents": [
+    {"name":"split_qkv_rmsnorm_rope_kernel_0","pid":1575648687,"tid":80,"ts":0.0,"dur":15.2,"ph":"X","args":{"Model Id":46,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":80,"Task Id":27,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"split_qkv_rmsnorm_rope_kernel_0","pid":1575648687,"tid":80,"ts":1836.25,"dur":17.0,"ph":"X","args":{"Model Id":46,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":80,"Task Id":52,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"split_qkv_rmsnorm_rope_kernel_0","pid":1575648687,"tid":80,"ts":3352.0,"dur":19.08,"ph":"X","args":{"Model Id":46,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":80,"Task Id":77,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"split_qkv_rmsnorm_rope_kernel_0","pid":1575648687,"tid":80,"ts":4947.0,"dur":23.5,"ph":"X","args":{"Model Id":46,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":80,"Task Id":102,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"split_qkv_rmsnorm_rope_kernel_0","pid":1575648687,"tid":80,"ts":6408.25,"dur":15.38,"ph":"X","args":{"Model Id":46,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":80,"Task Id":127,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"_situ_deepep_kernel_0","pid":1575648687,"tid":83,"ts":26252.0,"dur":21.3,"ph":"X","args":{"Model Id":47,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":83,"Task Id":120,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"_situ_deepep_kernel_0","pid":1575648687,"tid":83,"ts":27506.75,"dur":11.9,"ph":"X","args":{"Model Id":47,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":83,"Task Id":187,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"_situ_deepep_kernel_0","pid":1575648687,"tid":83,"ts":28314.75,"dur":10.62,"ph":"X","args":{"Model Id":47,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":83,"Task Id":270,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"_situ_deepep_kernel_0","pid":1575648687,"tid":83,"ts":29409.5,"dur":11.14,"ph":"X","args":{"Model Id":47,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":83,"Task Id":337,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}},
+    {"name":"_situ_deepep_kernel_0","pid":1575648687,"tid":83,"ts":30516.75,"dur":9.4,"ph":"X","args":{"Model Id":47,"Task Type":"AI_VECTOR_CORE","Physic Stream Id":83,"Task Id":404,"Batch Id":0,"Subtask Id":4294967295,"connection_id":39176}}
+  ],
+  "displayTimeUnit": "us",
+  "metadata": {
+    "source": "209 stored production capture, 2026-08-05",
+    "capture": "k3_current_c1_kernel_details_20260805_1233",
+    "original_event_count": 299671,
+    "note": "Ten exact NPU events extracted from the 73,572,131-byte trace; timestamps were rebased by subtracting the first event only."
+  }
+}

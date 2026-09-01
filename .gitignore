@@ -39,3 +39,5 @@ yarn-error.log*
 /outputs/
 /work/
 *.tsbuildinfo
+__pycache__/
+*.pyc

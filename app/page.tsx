@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
+import { KERNEL_OPS, TOTAL_TRITON_KERNELS } from "./kernel-ops";
 
 const SOURCE = {
   quick: "https://github.com/triton-lang/triton-ascend/blob/main/docs/en/quick_start.md",
@@ -16,6 +18,7 @@ const NAV = [
   ["start", "01", "起步"],
   ["anatomy", "02", "拆解 Kernel"],
   ["transfer", "03", "搬运实验室"],
+  ["stride", "03B", "Stride 布局"],
   ["parallel", "04", "Grid 并行"],
   ["ub", "05", "UB 估算"],
   ["cases", "06", "真实算子"],
@@ -62,6 +65,53 @@ const API_ROWS = [
   ["x.stride(0)", "相邻行首地址距离", "PyTorch 同名；offset = row × stride_b + col"],
   ["@triton.jit", "将函数编译成设备 kernel", "torch.compile 是图级编译，语义层次不同"],
   ["kernel[grid](...)", "按 grid 启动 kernel", "普通 Torch 运算隐藏了设备 launch 细节"],
+];
+
+type StrideScenario = {
+  id: string;
+  label: string;
+  expression: string;
+  shape: number[];
+  stride: number[];
+  storageOffset: number;
+  storageSize: number;
+  layout: string;
+  explanation: string;
+};
+
+const STRIDE_SCENARIOS: StrideScenario[] = [
+  { id:"one", label:"1D 连续", expression:"x = torch.arange(5)", shape:[5], stride:[1], storageOffset:0, storageSize:5, layout:"CONTIGUOUS", explanation:"索引每加 1，storage 中向后跨 1 个元素。" },
+  { id:"one-slice", label:"1D slice", expression:"y = x[1::2]", shape:[2], stride:[2], storageOffset:1, storageSize:5, layout:"STRIDED · 有洞", explanation:"共享 x 的 storage；起点移到 1，每个逻辑元素跨 2 个物理元素。" },
+  { id:"two", label:"2D 连续", expression:"x = torch.arange(12).reshape(3, 4)", shape:[3,4], stride:[4,1], storageOffset:0, storageSize:12, layout:"CONTIGUOUS", explanation:"换一行跨 4 个元素，换一列跨 1 个元素。" },
+  { id:"transpose", label:"2D transpose", expression:"t = x.transpose(0, 1)", shape:[4,3], stride:[1,4], storageOffset:0, storageSize:12, layout:"DENSE PERMUTATION", explanation:"不搬数据，只交换 shape 与 stride；逻辑相邻元素不一定物理相邻。" },
+  { id:"two-slice", label:"2D slice", expression:"s = x[:, ::2]", shape:[3,2], stride:[4,2], storageOffset:0, storageSize:12, layout:"STRIDED · 有洞", explanation:"列 stride 从 1 变成 2；view 没有 overlap，但中间 storage 元素未被使用。" },
+  { id:"three", label:"3D 连续", expression:"x = torch.arange(24).reshape(2, 3, 4)", shape:[2,3,4], stride:[12,4,1], storageOffset:0, storageSize:24, layout:"CONTIGUOUS", explanation:"连续 stride 从右向左计算：1、4、12。" },
+  { id:"permute", label:"3D permute", expression:"p = x.permute(2, 0, 1)", shape:[4,2,3], stride:[1,12,4], storageOffset:0, storageSize:24, layout:"DENSE PERMUTATION", explanation:"按新维度顺序同步重排 shape 与 stride，不复制 storage。" },
+  { id:"expand", label:"expand / stride=0", expression:"y = torch.tensor([[10], [20], [30]]).expand(3, 4)", shape:[3,4], stride:[1,0], storageOffset:0, storageSize:3, layout:"OVERLAPPING VIEW", explanation:"广播维 stride=0；同一行的 4 个逻辑坐标全部指向同一个物理元素。" },
+];
+
+const STRIDE_OPERATIONS = [
+  ["view", "是", "否；不兼容就报错", "只改 metadata；必须能用新 shape/stride 零拷贝表达"],
+  ["reshape / flatten", "可能", "可能静默复制", "能 view 就共享；transpose 后展平通常需要复制"],
+  ["transpose / .T", "是", "否", "交换两个维度的 shape 与 stride"],
+  ["permute / movedim", "是", "否", "按目标维度顺序重排 shape 与 stride"],
+  ["contiguous", "已连续时可能", "非连续时复制", "按逻辑坐标重排成目标 memory format 的连续 stride"],
+  ["clone", "否", "一定新 storage", "默认 preserve_format，可能保留 transpose 的非连续 stride"],
+  ["基础 slice / narrow / select", "是", "否", "改变 storage_offset、shape，步长 slice 还会放大对应 stride"],
+  ["tensor / list / bool 高级索引", "否", "是", "读取通常产生新 dense tensor；赋值仍写回原目标"],
+  ["index_put_", "目标不变", "否", "不改目标 stride，按目标逻辑 stride 原地写；重复 index 要考虑 accumulate"],
+  ["copy_", "目标不变", "否", "分别按 src stride 读、dst stride 写，不等同于 flat memcpy"],
+  ["unsqueeze / squeeze", "是", "否", "插入或删除 size=1 维；size=1 维的 stride 有自由度"],
+  ["expand", "是", "否", "广播维 stride 变 0，多个逻辑坐标 alias 同一物理地址"],
+  ["repeat / tile", "否", "是", "真正复制数据，结果通常是新的 dense layout"],
+  ["diagonal", "是", "否", "二维主对角线 stride 通常为 stride_row + stride_col"],
+  ["unfold", "是", "否", "新增窗口维并共享元素，常产生 overlapping view"],
+  ["as_strided", "是", "否", "手工指定 size/stride/offset；能造出洞、alias 或越界风险"],
+  ["flip", "通常否", "通常是", "PyTorch 通常复制，不应假设用负 stride 表示反向 view"],
+  ["cat / stack", "否", "是", "创建新输出，通常是 dense layout"],
+  ["detach", "是", "否", "只切断 autograd，shape/stride/storage 不变"],
+  ["to / cpu / dtype", "可能", "可能", "设备和 dtype 不变时可返回原 tensor，否则创建新 storage"],
+  ["pointwise / reduction / custom op", "看实现", "可能", "新 tensor 不保证标准 contiguous；必须检查实际输出 metadata"],
 ];
 
 const CASES = [
@@ -131,56 +181,259 @@ function CodeBlock({ children, label = "python" }: { children: string; label?: s
 }
 
 function TransferLab() {
-  const [n, setN] = useState(19);
-  const [block, setBlock] = useState(8);
-  const [pid, setPid] = useState(1);
+  const [dims, setDims] = useState<1 | 2 | 3>(2);
+  const [shape, setShape] = useState<[number, number, number]>([3, 7, 10]);
+  const [block, setBlock] = useState<[number, number, number]>([2, 3, 4]);
+  const [pid, setPid] = useState<[number, number, number]>([0, 1, 1]);
   const [phase, setPhase] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const grid = Math.ceil(n / block);
-  const safePid = Math.min(pid, Math.max(0, grid - 1));
-  const offsets = Array.from({ length: block }, (_, i) => safePid * block + i);
-  const valid = offsets.map((x) => x < n);
-  const phases = ["定位 program", "GM → UB：load x, y", "UB：x + y", "UB → GM：store output"];
+  const activeShape: [number, number, number] = [dims === 3 ? shape[0] : 1, dims >= 2 ? shape[1] : 1, shape[2]];
+  const activeBlock: [number, number, number] = [dims === 3 ? block[0] : 1, dims >= 2 ? block[1] : 1, block[2]];
+  const grid: [number, number, number] = activeShape.map((size, axis) => Math.ceil(size / activeBlock[axis])) as [number, number, number];
+  const safePid: [number, number, number] = pid.map((value, axis) => Math.min(value, Math.max(0, grid[axis] - 1))) as [number, number, number];
+  const starts: [number, number, number] = safePid.map((value, axis) => value * activeBlock[axis]) as [number, number, number];
+  const lanes = useMemo(() => {
+    const result: Array<{ local: [number, number, number]; global: [number, number, number]; offset: number; valid: boolean; x: number; y: number; sum: number }> = [];
+    for (let lz = 0; lz < activeBlock[0]; lz++) {
+      for (let ly = 0; ly < activeBlock[1]; ly++) {
+        for (let lx = 0; lx < activeBlock[2]; lx++) {
+          const global: [number, number, number] = [starts[0] + lz, starts[1] + ly, starts[2] + lx];
+          const valid = global[0] < activeShape[0] && global[1] < activeShape[1] && global[2] < activeShape[2];
+          const offset = (global[0] * activeShape[1] + global[1]) * activeShape[2] + global[2];
+          const x = offset + 1;
+          const y = (offset + 1) * 10;
+          result.push({ local: [lz, ly, lx], global, offset, valid, x, y, sum: x + y });
+        }
+      }
+    }
+    return result;
+  }, [activeBlock[0], activeBlock[1], activeBlock[2], activeShape[0], activeShape[1], activeShape[2], starts[0], starts[1], starts[2]]);
+  const phases = ["选择 grid 中的 program", "生成多维坐标、展平 offset 与 mask", "X、Y 分别从 GM 搬入 UB", "UB 中逐 lane 计算 X + Y", "把结果 C 从 UB 写回 GM"];
   useEffect(() => {
     if (!playing) return;
     const timer = window.setInterval(() => setPhase((p) => {
-      if (p === 3) { setPlaying(false); return 3; }
+      if (p === 4) { setPlaying(false); return 4; }
       return p + 1;
     }), 900);
     return () => window.clearInterval(timer);
   }, [playing]);
-  useEffect(() => { setPid((p) => Math.min(p, Math.max(0, grid - 1))); setPhase(0); }, [grid]);
+  useEffect(() => {
+    // The selected program must be clamped when the user changes shape/dimension.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPid((current) => current.map((value, axis) => Math.min(value, Math.max(0, grid[axis] - 1))) as [number, number, number]);
+    setPhase(0);
+  }, [dims, grid[0], grid[1], grid[2]]);
+
+  const setAxis = (setter: typeof setShape | typeof setBlock | typeof setPid, values: [number, number, number], axis: number, value: number) => {
+    const next = [...values] as [number, number, number];
+    next[axis] = value;
+    setter(next);
+    setPlaying(false);
+    setPhase(0);
+  };
+  const coordText = (coord: [number, number, number]) => dims === 1 ? `[${coord[2]}]` : dims === 2 ? `[${coord[1]},${coord[2]}]` : `[${coord.join(",")}]`;
+  const programText = (coord: [number, number, number]) => dims === 1 ? `(${coord[2]})` : dims === 2 ? `(${coord[2]},${coord[1]})` : `(${coord[2]},${coord[1]},${coord[0]})`;
+  const blockTuple = dims === 1 ? `(${activeBlock[2]})` : dims === 2 ? `(${activeBlock[1]}, ${activeBlock[2]})` : `(${activeBlock.join(", ")})`;
+  const gridTuple = dims === 1 ? `(${grid[2]},)` : dims === 2 ? `(${grid[2]}, ${grid[1]})` : `(${grid[2]}, ${grid[1]}, ${grid[0]})`;
+  const pidTuple = dims === 1 ? `(${safePid[2]})` : dims === 2 ? `(${safePid[2]}, ${safePid[1]})` : `(${safePid[2]}, ${safePid[1]}, ${safePid[0]})`;
+  const offsetFormula = dims === 1
+    ? `x = pidₓ×Bₓ+laneₓ；offset = x`
+    : dims === 2
+      ? `y = pidᵧ×Bᵧ+laneᵧ；x = pidₓ×Bₓ+laneₓ；offset = y×W+x`
+      : `z/y/x = pid×BLOCK+lane；offset = (z×H+y)×W+x`;
+  const exampleLane = lanes[0];
+  const globalDerivation = dims === 1
+    ? `x = pidₓ(${safePid[2]}) × Bₓ(${activeBlock[2]}) + laneₓ(${exampleLane.local[2]}) = ${exampleLane.global[2]}`
+    : dims === 2
+      ? `y = ${safePid[1]}×${activeBlock[1]}+${exampleLane.local[1]} = ${exampleLane.global[1]}；x = ${safePid[2]}×${activeBlock[2]}+${exampleLane.local[2]} = ${exampleLane.global[2]}`
+      : `z = ${safePid[0]}×${activeBlock[0]}+${exampleLane.local[0]} = ${exampleLane.global[0]}；y = ${safePid[1]}×${activeBlock[1]}+${exampleLane.local[1]} = ${exampleLane.global[1]}；x = ${safePid[2]}×${activeBlock[2]}+${exampleLane.local[2]} = ${exampleLane.global[2]}`;
+  const offsetDerivation = dims === 1
+    ? `offset = x = ${exampleLane.offset}`
+    : dims === 2
+      ? `offset = y×W+x = ${exampleLane.global[1]}×${activeShape[2]}+${exampleLane.global[2]} = ${exampleLane.offset}`
+      : `offset = (z×H+y)×W+x = (${exampleLane.global[0]}×${activeShape[1]}+${exampleLane.global[1]})×${activeShape[2]}+${exampleLane.global[2]} = ${exampleLane.offset}`;
+  const maskDerivation = dims === 1
+    ? `${exampleLane.global[2]} < N(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`
+    : dims === 2
+      ? `y(${exampleLane.global[1]}) < H(${activeShape[1]}) 且 x(${exampleLane.global[2]}) < W(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`
+      : `z(${exampleLane.global[0]}) < D(${activeShape[0]}) 且 y(${exampleLane.global[1]}) < H(${activeShape[1]}) 且 x(${exampleLane.global[2]}) < W(${activeShape[2]}) → ${exampleLane.valid ? "TRUE，可读取/写入" : "FALSE，禁止访问"}`;
+
+  const programPlanes = Array.from({ length: grid[0] }, (_, pz) => (
+    <div className="program-plane" key={pz}>
+      {dims === 3 && <small>grid z = {pz}</small>}
+      <div className="program-grid" style={{ gridTemplateColumns: `repeat(${grid[2]}, minmax(40px, 1fr))` }}>
+        {Array.from({ length: grid[1] }, (_, py) => Array.from({ length: grid[2] }, (_, px) => {
+          const selected = safePid[0] === pz && safePid[1] === py && safePid[2] === px;
+          const start = [pz * activeBlock[0], py * activeBlock[1], px * activeBlock[2]] as [number, number, number];
+          return <button key={`${pz}-${py}-${px}`} className={selected ? "selected" : ""} onClick={() => { setPid([pz, py, px]); setPhase(0); setPlaying(false); }} aria-pressed={selected}>
+            <b>pid {programText([pz, py, px])}</b><span>start {coordText(start)}</span>
+          </button>;
+        }))}
+      </div>
+    </div>
+  ));
+
+  const valueLayer = (name: string, stage: string, getter: (lane: typeof lanes[number]) => string | number, visible: boolean, accent: string) => (
+    <div className={`value-layer ${visible ? "visible" : "waiting"}`}>
+      <div className="value-layer-head"><b>{name}</b><span>{stage}</span></div>
+      <div className="tile-slices">
+        {Array.from({ length: activeBlock[0] }, (_, lz) => <div className="tile-slice" key={lz}>
+          {dims === 3 && <small>local z={lz} → global z={starts[0] + lz}</small>}
+          <div className="value-grid" style={{ gridTemplateColumns: `repeat(${activeBlock[2]}, minmax(44px, 1fr))`, "--layer-accent": accent } as CSSProperties}>
+            {lanes.filter((lane) => lane.local[0] === lz).map((lane) => <div key={`${name}-${lane.local.join("-")}`} className={lane.valid ? "valid" : "masked"}>
+              <i>{lane.valid && visible ? getter(lane) : lane.valid ? "·" : "MASK"}</i>
+              <span>{coordText(lane.global)}</span>
+            </div>)}
+          </div>
+        </div>)}
+      </div>
+    </div>
+  );
 
   return (
     <div className="lab transfer-lab">
+      <div className="dimension-tabs" aria-label="选择张量与 grid 维度">
+        <span>DIMENSION</span>
+        {([1, 2, 3] as const).map((value) => <button key={value} className={dims === value ? "active" : ""} onClick={() => { setDims(value); setPhase(0); setPlaying(false); }}>{value}D</button>)}
+        <p>{dims === 1 ? "向量：一个 program 搬一段连续元素" : dims === 2 ? "矩阵：program (pidᵧ,pidₓ) 搬一个二维 tile" : "体张量：program (pid_z,pidᵧ,pidₓ) 搬一个三维 block"}</p>
+      </div>
       <div className="lab-toolbar">
-        <label>N 元素 <input type="range" min="9" max="32" value={n} onChange={(e) => setN(+e.target.value)} /><b>{n}</b></label>
-        <label>BLOCK_SIZE <select value={block} onChange={(e) => setBlock(+e.target.value)}><option>4</option><option>8</option><option>16</option></select></label>
-        <label>program_id <input type="range" min="0" max={Math.max(0, grid - 1)} value={safePid} onChange={(e) => { setPid(+e.target.value); setPhase(0); }} /><b>{safePid}</b></label>
-        <button className="action" onClick={() => { setPhase(0); setPlaying(true); }}>{playing ? "搬运中…" : "▶ 播放搬运"}</button>
-        <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 4); }}>单步 →</button>
+        <div className="control-group"><span>SHAPE</span>
+          {dims === 3 && <label>D/Z <input type="range" min="2" max="4" value={shape[0]} onChange={(e) => setAxis(setShape, shape, 0, +e.target.value)} /><b>{shape[0]}</b></label>}
+          {dims >= 2 && <label>H/Y <input type="range" min="4" max="9" value={shape[1]} onChange={(e) => setAxis(setShape, shape, 1, +e.target.value)} /><b>{shape[1]}</b></label>}
+          <label>{dims === 1 ? "N/X" : "W/X"} <input type="range" min={dims === 1 ? 9 : 5} max={dims === 1 ? 32 : 12} value={shape[2]} onChange={(e) => setAxis(setShape, shape, 2, +e.target.value)} /><b>{shape[2]}</b></label>
+        </div>
+        <div className="control-group"><span>BLOCK_SIZE</span>
+          {dims === 3 && <label>Bz <select value={block[0]} onChange={(e) => setAxis(setBlock, block, 0, +e.target.value)}><option>1</option><option>2</option></select></label>}
+          {dims >= 2 && <label>By <select value={block[1]} onChange={(e) => setAxis(setBlock, block, 1, +e.target.value)}><option>2</option><option>3</option><option>4</option></select></label>}
+          <label>Bx <select value={block[2]} onChange={(e) => setAxis(setBlock, block, 2, +e.target.value)}>{(dims === 1 ? [4, 8, 16] : [2, 3, 4]).map((value) => <option key={value}>{value}</option>)}</select></label>
+        </div>
+        <div className="control-group"><span>PROGRAM_ID</span>
+          {dims === 3 && <label>pid_z <input type="range" min="0" max={grid[0] - 1} value={safePid[0]} onChange={(e) => setAxis(setPid, safePid, 0, +e.target.value)} /><b>{safePid[0]}</b></label>}
+          {dims >= 2 && <label>pid_y <input type="range" min="0" max={grid[1] - 1} value={safePid[1]} onChange={(e) => setAxis(setPid, safePid, 1, +e.target.value)} /><b>{safePid[1]}</b></label>}
+          <label>pid_x <input type="range" min="0" max={grid[2] - 1} value={safePid[2]} onChange={(e) => setAxis(setPid, safePid, 2, +e.target.value)} /><b>{safePid[2]}</b></label>
+        </div>
       </div>
       <div className="equation-strip">
-        <span>grid = ceil({n}/{block}) = <strong>{grid}</strong></span>
-        <span>block_start = {safePid}×{block} = <strong>{safePid * block}</strong></span>
-        <span>有效 lane = <strong>{valid.filter(Boolean).length}/{block}</strong></span>
+        <span>shape = <strong>{dims === 1 ? `[${shape[2]}]` : dims === 2 ? `[${shape[1]}, ${shape[2]}]` : `[${shape.join(", ")}]`}</strong></span>
+        <span>BLOCK = <strong>{blockTuple}</strong></span>
+        <span>grid = cdiv(shape, block) = <strong>{gridTuple}</strong></span>
+        <span>pid = <strong>{pidTuple}</strong></span>
+        <span>block_start = <strong>{coordText(starts)}</strong></span>
+        <span>有效 lanes = <strong>{lanes.filter((lane) => lane.valid).length}/{lanes.length}</strong></span>
       </div>
-      <div className="memory-stage" aria-label="全局内存到统一缓冲区的搬运模拟">
-        <div className={`memory-zone gm ${phase === 1 || phase === 3 ? "active" : ""}`}>
-          <div className="zone-title"><span>GM / HBM</span><small>大容量 · 高延迟</small></div>
-          <div className="tensor-row">{Array.from({ length: n }, (_, i) => <i key={i} className={offsets.includes(i) && phase <= 1 ? "selected" : ""}>{i}</i>)}</div>
-        </div>
-        <div className={`bus ${phase === 1 ? "to-ub" : phase === 3 ? "to-gm" : ""}`}><span>{phase === 3 ? "STORE" : "LOAD"}</span><i /></div>
-        <div className={`memory-zone ub ${phase === 2 ? "active" : ""}`}>
-          <div className="zone-title"><span>UB / 片上工作集</span><small>当前 program 私有视图</small></div>
-          <div className="lane-grid">
-            {offsets.map((off, i) => <div key={i} className={`lane ${valid[i] ? "valid" : "masked"} ${phase === 2 ? "computing" : ""}`}><b>L{i}</b><span>off {off}</span><em>{valid[i] ? (phase >= 2 ? `${off}+${off + 1}=${off * 2 + 1}` : `x[${off}], y[${off}]`) : "MASK"}</em></div>)}
+      <div className="multidim-formula">
+        <b>地址展开</b><code>{offsetFormula}</code><span>grid tuple 按 Triton 轴写作 x→axis 0、y→axis 1、z→axis 2；内存仍按最后一维 X 连续。</span>
+      </div>
+      <div className={`program-selector ${phase === 0 ? "active" : ""}`}>
+        <div className="zone-title"><span>GRID / PROGRAM MAP</span><small>点击任一 program，观察它负责的 block</small></div>
+        {programPlanes}
+      </div>
+      <div className="coordinate-ledger">
+        <div className="zone-title"><span>块内 LANE → 张量坐标 → 内存 OFFSET</span><small>每一行代表当前 program 同时处理的一个数据槽位</small></div>
+        <div className="coordinate-explainer">
+          <div className="coordinate-reading">
+            <span>这一行应该读成</span>
+            <b>{coordText(exampleLane.local)}</b><i>块内第几个槽位</i><em>→</em>
+            <b>{coordText(exampleLane.global)}</b><i>整个张量中的坐标</i><em>→</em>
+            <b>{exampleLane.offset}</b><i>从首地址数第几个元素</i><em>→</em>
+            <b className={exampleLane.valid ? "ok" : "no"}>{exampleLane.valid ? "TRUE" : "FALSE"}</b><i>{exampleLane.valid ? "允许 load / store" : "必须被 mask"}</i>
           </div>
+          <div className="coordinate-derivation">
+            <p><b>① 块内坐标</b><code>{coordText(exampleLane.local)}</code><span>由 <code>tl.arange</code> 生成，只表示它在当前 block 内的位置。</span></p>
+            <p><b>② 张量坐标</b><code>{coordText(exampleLane.global)}</code><span>{globalDerivation}</span></p>
+            <p><b>③ 展平 offset</b><code>{exampleLane.offset}</code><span>{offsetDerivation}；所以访问 <code>x_ptr + {exampleLane.offset}</code>。</span></p>
+            <p><b>④ mask</b><code>{exampleLane.valid ? "TRUE" : "FALSE"}</code><span>{maskDerivation}</span></p>
+          </div>
+          <p className="coordinate-note"><b>注意：</b><code>offset</code> 是“元素下标”，不是字节数。若 dtype 是 fp32，第 {exampleLane.offset} 个元素的字节地址才是 <code>base + {exampleLane.offset} × 4</code>。</p>
+        </div>
+        <div className="coordinate-table"><div><b>① block 内坐标</b><b>② 张量全局坐标</b><b>③ 首地址 + 元素下标</b><b>④ 可否访问</b></div>{lanes.map((lane) => <div key={`coord-${lane.local.join("-")}`} className={lane.valid ? "" : "masked"}><code>{coordText(lane.local)}</code><code>{coordText(lane.global)}</code><code>base + {lane.offset}</code><strong>{lane.valid ? "TRUE · 搬运" : "FALSE · 跳过"}</strong></div>)}</div>
+      </div>
+      <div className="memory-stage-v2" aria-label={`${dims}维 X 和 Y 从全局内存搬到统一缓冲区、相加并写回 C 的模拟`}>
+        <div className={`memory-column gm ${phase === 2 ? "active" : ""}`}>
+          <div className="zone-title"><span>GM / SOURCE</span><small>两个独立输入张量</small></div>
+          {valueLayer("X", `global ${dims}D tensor`, (lane) => lane.x, true, "var(--cyan)")}
+          {valueLayer("Y", `global ${dims}D tensor`, (lane) => lane.y, true, "var(--orange)")}
+        </div>
+        <div className={`bus-v2 ${phase === 2 ? "active load" : ""}`}><span>LOAD X</span><span>LOAD Y</span><i /></div>
+        <div className={`memory-column ub ${phase === 2 || phase === 3 ? "active" : ""}`}>
+          <div className="zone-title"><span>UB / CURRENT BLOCK</span><small>{blockTuple} lanes</small></div>
+          {valueLayer("X_tile", "tl.load(x_ptr + offsets)", (lane) => lane.x, phase >= 2, "var(--cyan)")}
+          {valueLayer("Y_tile", "tl.load(y_ptr + offsets)", (lane) => lane.y, phase >= 2, "var(--orange)")}
+          <div className="alu-sign"><span>X_tile</span><b>+</b><span>Y_tile</span><i>逐 lane 并行</i></div>
+          {valueLayer("C_tile = X + Y", "UB compute result", (lane) => lane.sum, phase >= 3, "var(--acid)")}
+        </div>
+        <div className={`bus-v2 store ${phase === 4 ? "active" : ""}`}><span>STORE C</span><i /></div>
+        <div className={`memory-column output ${phase === 4 ? "active" : ""}`}>
+          <div className="zone-title"><span>GM / OUTPUT C</span><small>只写 mask=true 的位置</small></div>
+          {valueLayer("C", `output shape ${dims}D`, (lane) => lane.sum, phase >= 4, "var(--acid)")}
         </div>
       </div>
-      <div className="step-line"><b>STEP {phase + 1}/4</b><span>{phases[phase]}</span><code>{phase === 0 ? `offsets = ${safePid * block} + arange(0, ${block})` : phase === 1 ? "tl.load(ptr + offsets, mask=offsets < N)" : phase === 2 ? "result = x + y  # 各 lane 同时" : "tl.store(output_ptr + offsets, result, mask)"}</code></div>
+      <div className="transfer-playback-controls" aria-label="DATA MOVEMENT 播放与单步控制">
+        <div><span>TRANSFER PLAYBACK</span><b>STEP {phase + 1} / 5 · {phases[phase]}</b><small>控制紧跟搬运展示；播放会从 Grid 开始连续演示，单步每次前进一个阶段。</small></div>
+        <div className="transport-actions">
+          <button className="action" onClick={() => { setPhase(0); setPlaying(true); }} aria-label="播放 DATA MOVEMENT 搬运过程">{playing ? "搬运中…" : "▶ 播放搬运"}</button>
+          <button onClick={() => { setPlaying(false); setPhase((phase + 1) % 5); }} aria-label="DATA MOVEMENT 单步前进">单步 →</button>
+        </div>
+      </div>
+      <div className="step-line"><b>STEP {phase + 1}/5</b><span>{phases[phase]}</span><code>{phase === 0 ? `pid = ${pidTuple} in grid ${gridTuple}` : phase === 1 ? offsetFormula : phase === 2 ? "x = tl.load(x_ptr + offsets, mask); y = tl.load(y_ptr + offsets, mask)" : phase === 3 ? "c = x + y  # X、Y、C 三组数值分开显示" : "tl.store(c_ptr + offsets, c, mask=mask)"}</code></div>
     </div>
   );
+}
+
+function unravelIndex(linear: number, shape: number[]) {
+  const coord = Array(shape.length).fill(0) as number[];
+  let rest = linear;
+  for (let axis = shape.length - 1; axis >= 0; axis--) {
+    coord[axis] = rest % shape[axis];
+    rest = Math.floor(rest / shape[axis]);
+  }
+  return coord;
+}
+
+function StrideLab() {
+  const [scenarioId, setScenarioId] = useState("transpose");
+  const [selectedLinear, setSelectedLinear] = useState(7);
+  const scenario = STRIDE_SCENARIOS.find((item) => item.id === scenarioId) ?? STRIDE_SCENARIOS[0];
+  const logicalCount = scenario.shape.reduce((product, size) => product * size, 1);
+  const cells = Array.from({ length: logicalCount }, (_, linear) => {
+    const coord = unravelIndex(linear, scenario.shape);
+    const offset = scenario.storageOffset + coord.reduce((sum, index, axis) => sum + index * scenario.stride[axis], 0);
+    return { linear, coord, offset };
+  });
+  const selected = cells[Math.min(selectedLinear, cells.length - 1)];
+  const selectedTerms = selected.coord.map((index, axis) => `${index}×${scenario.stride[axis]}`);
+  const aliases = cells.filter((cell) => cell.offset === selected.offset).length;
+  const usedOffsets = new Set(cells.map((cell) => cell.offset));
+
+  return <div className="stride-lab">
+    <div className="stride-scenario-tabs" aria-label="选择 stride 示例">{STRIDE_SCENARIOS.map((item) => <button key={item.id} className={item.id === scenario.id ? "active" : ""} onClick={() => { setScenarioId(item.id); setSelectedLinear(0); }}>{item.label}</button>)}</div>
+    <div className="stride-metadata">
+      <div><span>PYTORCH</span><code>{scenario.expression}</code></div>
+      <div><span>SHAPE</span><b>({scenario.shape.join(", ")})</b></div>
+      <div><span>STRIDE · elements</span><b>({scenario.stride.join(", ")})</b></div>
+      <div><span>STORAGE OFFSET</span><b>{scenario.storageOffset}</b></div>
+      <div><span>LAYOUT</span><b>{scenario.layout}</b></div>
+    </div>
+    <div className="stride-formula-band"><span>统一地址公式</span><code>element_offset = storage_offset + Σ index[d] × stride[d]</code><small>真正字节地址 = storage_base + element_offset × element_size()；stride 本身不是字节数。</small></div>
+    <div className="stride-map">
+      <div className="stride-logical">
+        <div className="stride-map-head"><span>LOGICAL TENSOR</span><small>点击任一逻辑坐标</small></div>
+        <div className="stride-logical-grid" style={{ "--stride-cols": scenario.shape.at(-1) } as CSSProperties}>{cells.map((cell) => <button key={cell.linear} className={cell.linear === selected.linear ? "selected" : ""} onClick={() => setSelectedLinear(cell.linear)}><small>[{cell.coord.join(",")}]</small><b>→ {cell.offset}</b></button>)}</div>
+      </div>
+      <div className="stride-address-arrow"><span>shape + stride</span><b>→</b><small>{scenario.explanation}</small></div>
+      <div className="stride-storage">
+        <div className="stride-map-head"><span>PHYSICAL STORAGE</span><small>底层永远是一维元素序列</small></div>
+        <div className="stride-storage-strip">{Array.from({ length: scenario.storageSize }, (_, offset) => <i key={offset} className={`${offset === selected.offset ? "selected" : ""} ${usedOffsets.has(offset) ? "used" : "hole"}`}><small>offset</small><b>{offset}</b></i>)}</div>
+      </div>
+    </div>
+    <div className="stride-derivation">
+      <div><span>当前逻辑坐标</span><b>[{selected.coord.join(", ")}]</b></div>
+      <div><span>代入公式</span><code>{scenario.storageOffset} + {selectedTerms.join(" + ")}</code></div>
+      <div><span>物理元素位置</span><b>storage[{selected.offset}]</b></div>
+      <div><span>地址别名</span><b>{aliases > 1 ? `${aliases} 个逻辑坐标共用` : "唯一物理元素"}</b></div>
+    </div>
+  </div>;
 }
 
 function ParallelLab() {
@@ -194,13 +447,23 @@ function ParallelLab() {
       <div className="lab-toolbar">
         <label>total_tasks <input type="range" min="5" max="18" value={tasks} onChange={(e) => { setTasks(+e.target.value); setTick(0); }} /><b>{tasks}</b></label>
         <label>grid / kernel_num <input type="range" min="2" max="6" value={cores} onChange={(e) => { setCores(+e.target.value); setTick(0); }} /><b>{cores}</b></label>
-        <button className="action" onClick={() => setTick((tick + 1) % (rounds + 1))}>推进一轮 →</button>
+        <label>当前循环轮次 k <b>{tick < rounds ? tick : "结束"}</b></label>
+        <button className="action" onClick={() => setTick((tick + 1) % (rounds + 1))}>推进一轮 k →</button>
+      </div>
+      <div className="task-scope-explainer">
+        <div className="scope-answer"><span>total_tasks 到底数什么？</span><strong>{tasks} 个逻辑工作单元</strong><p>它由 kernel 定义“一个 task 做多少工作”，<b>不是某个固定变量的 numel，也不是 X、Y、C 等所有变量 numel 的总和。</b></p></div>
+        <div className="task-examples">
+          <p><b>向量加</b><code>task = 一段 BLOCK 元素</code><span>total_tasks = ceil(N / BLOCK)</span></p>
+          <p><b>RMSNorm</b><code>task = 一行或 block_l 行</code><span>total_tasks = ceil(B×L / block_l)，C 是 task 内部元素</span></p>
+          <p><b>矩阵计算</b><code>task = 一个 [BM,BN] 输出 tile</code><span>total_tasks = ceil(M/BM) × ceil(N/BN)</span></p>
+        </div>
+        <div className="task-scope-flow"><span>完整张量 / 输出空间</span><i>按 kernel 规则切分</i><strong>{tasks} tasks</strong><i>按 pid + k×P 分配</i><strong>{cores} programs</strong></div>
       </div>
       <div className="parallel-map">
         {assignments.map((lane, pid) => <div className="core-lane" key={pid}>
           <div className="core-label"><i />Program {pid}<small>pid={pid}</small></div>
           <div className="timeline">
-            {lane.map((task, r) => <div key={task} className={`task ${r < tick ? "done" : r === tick ? "now" : ""}`}><b>task {task}</b><small>{pid} + {r}×{cores}</small></div>)}
+            {lane.map((task, k) => <div key={task} className={`task ${k < tick ? "done" : k === tick ? "now" : ""}`}><b>k={k} → task {task}</b><small>{pid} + {k}×{cores} = {task}</small></div>)}
           </div>
         </div>)}
       </div>
@@ -210,7 +473,7 @@ function ParallelLab() {
 }
 
 function UbCalculator() {
-  const [tile, setTile] = useState(8192);
+  const [tile, setTile] = useState(1024);
   const [bytes, setBytes] = useState(2);
   const [live, setLive] = useState(3);
   const [buffers, setBuffers] = useState(1);
@@ -224,8 +487,58 @@ function UbCalculator() {
   const pct = Math.min(100, kib / capacity * 100);
   return (
     <div className="lab ub-lab">
+      <div className="ub-scope-explainer">
+        <div className="ub-definition">
+          <span>TILE 元素数</span>
+          <p><b>Tile 元素数是一个 program 处理一个 task 的一轮中，单张工作 tile 的元素数量。</b></p>
+          <strong>当前估算器：{tile.toLocaleString()} elements</strong>
+        </div>
+        <div className="ub-example-grid">
+          <article>
+            <small>逐元素算子 · 1D</small>
+            <pre><code>{`BLOCK_SIZE = 1024
+
+X_tile = 1024 个元素
+Y_tile = 1024 个元素
+C_tile = 1024 个元素
+
+tile 元素数 = 1024
+同时存活张量 = 3`}</code></pre>
+            <p><code>X</code>、<code>Y</code>、<code>C</code> 各是一张 tile；三张形状相同，所以估算器填 <b>1024</b>，再把同时存活张量设为 <b>3</b>，不是把 tile 填成 3072。</p>
+          </article>
+          <article>
+            <small>二维算子 · 2D</small>
+            <pre><code>{`BLOCK_M = 32
+BLOCK_N = 64
+
+tile 元素数
+= BLOCK_M × BLOCK_N
+= 32 × 64
+= 2048`}</code></pre>
+            <p>二维 tile 先按两个轴相乘。这里一张 tile 覆盖 <b>32 行 × 64 列</b>，所以单张 tile 是 <b>2048</b> 个元素。</p>
+          </article>
+          <article>
+            <small>归约算子 · Reduction</small>
+            <pre><code>{`BLOCK_L = 4
+C = 4096
+
+X_tile 元素数
+= BLOCK_L × C
+= 4 × 4096
+= 16384`}</code></pre>
+            <p>归约输入 <code>X_tile</code> 同时覆盖 <b>4 行 × 4096 个归约列</b>。若输出或临时量的 tile 形状不同，应分别计算后相加，不能都套用 16384。</p>
+          </article>
+        </div>
+        <div className="ub-round-cycle">
+          <div><span>每个 program 每轮只处理一个 task</span><strong>第 k 轮</strong></div>
+          <ol>
+            <li>取一个 task</li><li>搬入这个 task 的 tile</li><li>在 UB 计算</li><li>写回</li><li>UB 空间复用</li><li>进入下一轮</li>
+          </ol>
+        </div>
+        <p className="ub-no-multiply"><b>当前快捷估算（假设 {live} 张存活张量的 tile 大小相同）：</b><code>{tile} × {bytes} B × {live} 张同时存活 × {buffers} 份缓冲</code>。不要再乘 <code>total_tasks</code> 或 Grid program 数；task 分轮进入同一个 UB。若各张量 tile 大小不同，应改为逐张计算 <code>Σ align32(tileᵢ × dtypeᵢ)</code>。</p>
+      </div>
       <div className="ub-controls">
-        <label>Tile 元素数 <input type="number" min="128" step="128" value={tile} onChange={(e) => setTile(Math.max(128, +e.target.value))} /></label>
+        <label>单张 Tile 元素数 <input type="number" min="128" step="128" value={tile} onChange={(e) => setTile(Math.max(128, +e.target.value))} /><small>例如向量 BLOCK；二维 tile 填 BM×BN</small></label>
         <label>dtype <select value={bytes} onChange={(e) => setBytes(+e.target.value)}><option value="1">int8 · 1 B</option><option value="2">fp16/bf16 · 2 B</option><option value="4">fp32 · 4 B</option></select></label>
         <label>同时存活张量 <input type="range" min="1" max="6" value={live} onChange={(e) => setLive(+e.target.value)} /><b>{live}</b></label>
         <label>缓冲份数 <select value={buffers} onChange={(e) => setBuffers(+e.target.value)}><option value="1">单缓冲 ×1</option><option value="2">双缓冲 ×2</option></select></label>
@@ -241,35 +554,6 @@ function UbCalculator() {
         </div>
       </div>
       <div className="truth-note"><b>这是“设计前估算”，不是编译器精确报告。</b> 实际 UB 还受临时量、数据布局、对齐、流水、多缓冲和编译器生命周期分析影响。仓库的融合 argmax 案例直接用 <code>_TILE_BYTES = 32 × 1024</code> 控制单个词表 tile，并指出过宽 tile 与自动多缓冲会触发 UB overflow——所以最终要结合编译日志与逐步减小 BLOCK 验证。</div>
-    </div>
-  );
-}
-
-function CaseSimulator() {
-  const [kind, setKind] = useState("rms");
-  const [values, setValues] = useState("1,2,3,4");
-  const nums = useMemo(() => values.split(/[,\s]+/).map(Number).filter(Number.isFinite).slice(0, 8), [values]);
-  const steps = useMemo(() => {
-    if (!nums.length) return ["请输入数字"];
-    if (kind === "rms") {
-      const squares = nums.map((x) => x * x);
-      const variance = squares.reduce((a, b) => a + b, 0) / nums.length;
-      const rstd = 1 / Math.sqrt(variance + 1e-6);
-      return [`x² = [${squares.map(x => x.toFixed(2)).join(", ")}]`, `mean(x²) = ${variance.toFixed(4)}`, `rsqrt(var+eps) = ${rstd.toFixed(4)}`, `y = [${nums.map(x => (x * rstd).toFixed(4)).join(", ")}]`];
-    }
-    if (kind === "swiglu") {
-      const even = nums.filter((_, i) => i % 2 === 0);
-      const odd = nums.filter((_, i) => i % 2 === 1);
-      const out = even.slice(0, odd.length).map((g, i) => g * (1 / (1 + Math.exp(-g))) * (odd[i] + 1));
-      return [`gate = 偶数列 [${even.join(", ")}]`, `up = 奇数列 [${odd.join(", ")}]`, `SiLU(gate) = [${even.map(g => (g / (1 + Math.exp(-g))).toFixed(4)).join(", ")}]`, `out = SiLU(gate) × (up+1) = [${out.map(x => x.toFixed(4)).join(", ")}]`];
-    }
-    const max = Math.max(...nums); const arg = nums.indexOf(max); const exps = nums.map(x => Math.exp(x - max)); const sum = exps.reduce((a, b) => a + b, 0);
-    return [`m = max(logits) = ${max}，argmax = ${arg}`, `exp(x-m) = [${exps.map(x => x.toFixed(4)).join(", ")}]`, `sumexp = ${sum.toFixed(4)}`, `P(argmax) = 1/sumexp = ${(1 / sum).toFixed(4)}`];
-  }, [kind, nums]);
-  return (
-    <div className="case-sim">
-      <div className="sim-inputs"><div><span>算子</span>{[["rms", "RMSNorm"], ["swiglu", "SwiGLU"], ["softmax", "Argmax+Softmax"]].map(([id, name]) => <button key={id} className={kind === id ? "active" : ""} onClick={() => setKind(id)}>{name}</button>)}</div><label>输入小张量 <input value={values} onChange={(e) => setValues(e.target.value)} aria-label="逗号分隔的小张量数值" /></label></div>
-      <div className="calc-pipeline">{steps.map((s, i) => <div key={s}><b>0{i + 1}</b><span>{s}</span></div>)}</div>
     </div>
   );
 }
@@ -306,7 +590,7 @@ export default function Home() {
             <h1>别只读代码。<br/><em>看见数据怎么跑。</em></h1>
             <p>一份从 PyTorch 到 Triton-Ascend 的中文可视化教程：亲手调 <code>grid</code>、追踪 <code>offset</code>、估算 UB，并拆开真实推理算子的每一步。</p>
             <div className="hero-actions"><a href="#transfer" className="primary">开始搬运实验 <b>→</b></a><a href="#start-checklist">先配置环境</a></div>
-            <div className="hero-meta"><span><b>4</b> 交互实验</span><span><b>14</b> 接口对照</span><span><b>4</b> 真实算子</span></div>
+            <div className="hero-meta"><span><b>5</b> 交互实验</span><span><b>14</b> 接口对照</span><span><b>{KERNEL_OPS.length}</b> Triton 模块</span></div>
           </div>
           <div className="hero-visual" aria-label="program 并行处理张量示意图">
             <div className="visual-head"><span>VECTOR_ADD.TRITON</span><i>LIVE TRACE</i></div>
@@ -325,6 +609,22 @@ export default function Home() {
             <article><span>硬件</span><b>Atlas A2 / A3 / A5</b><p>Linux aarch64 / x86_64；官方快速开始建议单卡 32 GB 内存。</p></article>
             <article><span>软件</span><b>Python 3.9–3.11</b><p>CANN 推荐 9.0.0；quick start 当前匹配 torch_npu 2.7.1.post4。</p></article>
             <article><span>安装</span><b>triton-ascend 3.2.1+</b><p>此版本起声明 Triton 依赖，缓解后装依赖覆盖 Ascend 版本的问题。</p></article>
+          </div>
+          <div className="lane-tile-primer">
+            <header><span>先认清两个词</span><h3>Tile 是工作块，lane 是块内位置。</h3><p><b>tile</b> 是一个 Triton program 当前一轮处理的逻辑数据块；每个输入、输出变量可以拥有自己的 tile。<b>lane</b> 是 tile 内展平后的逻辑位置编号，经 tile 起点、shape 与 stride 换算后才得到全局元素地址。这里的 lane 不是 CUDA 线程编号，也不保证对应一个真实 NPU 执行通道。</p></header>
+            <div className="lane-example one-d">
+              <div className="lane-example-title"><span>1D EXAMPLE</span><b>BLOCK_SIZE = 8 · N = 20 · pid = 2</b></div>
+              <code>tile 起点 = pid × BLOCK_SIZE = 16</code>
+              <div className="lane-strip">{Array.from({ length: 8 }, (_, lane) => <i key={lane} className={lane >= 4 ? "masked" : ""}><small>lane {lane}</small><b>{16 + lane}</b></i>)}</div>
+              <p><code>lane 3</code> → local <code>3</code> → global <code>16 + 3 = 19</code> → <b>19 &lt; N，mask=true</b>。lane 4 对应 global 20，已经越界。</p>
+            </div>
+            <div className="lane-example two-d">
+              <div className="lane-example-title"><span>2D EXAMPLE</span><b>BLOCK_M = 2 · BLOCK_N = 4 · pid = [1,2]</b></div>
+              <code>local_m = lane // 4 · local_n = lane % 4</code>
+              <div className="lane-matrix">{Array.from({ length: 8 }, (_, lane) => <i key={lane} className={lane === 5 ? "active" : ""}><small>{lane}</small><b>[{Math.floor(lane / 4)},{lane % 4}]</b></i>)}</div>
+              <p><code>lane 5</code> → local <code>[1,1]</code>；tile 起点是 <code>[2,8]</code>，所以 global <code>[3,9]</code>。若完整 shape 是 <code>[5,10]</code>，flat offset = <code>3 × 10 + 9 = 39</code>。</p>
+            </div>
+            <footer><code>lane → local coord → global coord → flat offset → mask → tl.load / tl.store</code></footer>
           </div>
           <div className="setup-grid">
             <div>
@@ -357,8 +657,59 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         </section>
 
         <section id="transfer" className="wide-section dark-section">
-          <div className="section-head light"><span>03 / DATA MOVEMENT</span><h2>拖动 pid，看尾块怎样被 mask。</h2><p>设定 N 与 BLOCK_SIZE，观察 GM → UB → ALU → GM 的完整生命周期。</p></div>
+          <div className="section-head light"><span>03 / DATA MOVEMENT</span><h2>切换 1D / 2D / 3D，看每个 block 怎样搬。</h2><p>逐轴设定 shape、BLOCK_SIZE 与 program_id，观察 X、Y 从 GM 进入 UB、并行相加并把 C 写回 GM 的完整生命周期。</p></div>
           <TransferLab />
+        </section>
+
+        <section id="stride" className="stride-section">
+          <div className="section-head"><span>03B / STRIDE &amp; MEMORY LAYOUT</span><h2>Shape 说“有几格”，stride 决定“下一格在哪”。</h2><p>stride 是某一维索引增加 1 时，在底层 storage 中跨过的元素数量。它不是字节数；只有再乘 <code>element_size()</code> 才得到字节距离。</p></div>
+          <div className="stride-foundation">
+            <article><span>01</span><b>storage</b><p>真正保存数据的一维物理元素序列；多个 Tensor view 可以共享它。</p></article>
+            <article><span>02</span><b>storage_offset</b><p>当前 view 的逻辑原点位于 storage 的第几个元素；slice 常改变它。</p></article>
+            <article><span>03</span><b>shape</b><p>每个逻辑维度有多长。shape 相同不代表物理布局相同。</p></article>
+            <article><span>04</span><b>stride</b><p>每个逻辑维度前进一步要跨多少个 storage 元素，决定坐标到地址的映射。</p></article>
+          </div>
+          <p className="stride-four-tuple"><code>Tensor 的逻辑解释 = storage + storage_offset + shape + stride</code><span>只检查 shape，无法识别 transpose、带洞 slice、stride=0 alias 或 memory format 的差异。</span></p>
+          <div className="stride-dimension-rules">
+            <article><span>1D</span><code>shape=(N) → stride=(1)</code><p>连续向量：<code>offset(i)=i</code>。若 <code>x[1::2]</code>，则 offset=1、stride=(2)。</p></article>
+            <article><span>2D</span><code>shape=(M,N) → stride=(N,1)</code><p><code>offset(row,col)=row×stride₀+col×stride₁</code>。transpose 只交换 shape/stride。</p></article>
+            <article><span>3D</span><code>shape=(D₀,D₁,D₂) → (D₁×D₂,D₂,1)</code><p>从右向左：<code>stride[-1]=1</code>，<code>stride[i]=shape[i+1]×stride[i+1]</code>。</p></article>
+          </div>
+          <StrideLab />
+          <div className="stride-layout-kinds">
+            <article><b>标准 contiguous</b><code>(3,4) / (4,1)</code><p>逻辑行优先顺序就是物理顺序；<code>is_contiguous() == True</code>。</p></article>
+            <article><b>Dense permutation</b><code>(4,3) / (1,4)</code><p>transpose 没有洞、没有重叠，但维度物理顺序变了；标准 contiguous 为 False。</p></article>
+            <article><b>带洞 strided view</b><code>(3,2) / (4,2)</code><p><code>x[:,::2]</code> 没有 overlap，但最小步长已经大于 1，部分 storage 未使用。</p></article>
+            <article><b>Overlapping view</b><code>(3,4) / (1,0)</code><p><code>expand</code> 的多个逻辑位置映射到同一物理元素，原地并行写可能发生冲突。</p></article>
+            <article><b>Channels-last</b><code>NCHW shape / NHWC-like stride</code><p>逻辑 shape 仍是 NCHW，但物理 stride 不同；用 <code>is_contiguous(memory_format=torch.channels_last)</code> 单独判断。</p></article>
+          </div>
+          <h3 className="subhead">常见 PyTorch 操作怎样改变 stride</h3>
+          <div className="table-wrap stride-operation-table"><table><thead><tr><th>操作</th><th>共享原 storage</th><th>是否复制</th><th>对 stride / 地址语义的影响</th></tr></thead><tbody>{STRIDE_OPERATIONS.map((row) => <tr key={row[0]}><td><code>{row[0]}</code></td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td></tr>)}</tbody></table></div>
+          <div className="stride-critical-diffs">
+            <article><span>VIEW vs RESHAPE</span><b><code>view</code> 不会偷偷复制；<code>reshape</code> 可能会。</b><p>transpose 后 <code>view(-1)</code> 通常报错，而 <code>reshape(-1)</code> 会在无法零拷贝时先复制。</p></article>
+            <article><span>CLONE vs CONTIGUOUS</span><b>新 storage 不等于标准连续。</b><p><code>clone()</code> 默认 preserve_format，可能保留 <code>(1,4)</code>；<code>contiguous()</code> 才按逻辑坐标重排成 <code>(3,1)</code>。</p></article>
+            <article><span>EXPAND vs REPEAT</span><b><code>expand</code> 用 stride=0 alias；<code>repeat</code> 真复制。</b><p>前者省内存但多个逻辑坐标共用元素，后者占用新 storage、每个元素独立。</p></article>
+          </div>
+          <div className="stride-abi-warning">
+            <span>CUSTOM KERNEL ABI</span><h3>不要看到非连续 Tensor 就一律 contiguous，也不要一律按 stride 写。</h3>
+            <p>先确认生产者和消费者约定的是哪种语义：若 Triton / PyTorch 算子接收并使用每一维 stride，应保持“原 view pointer + 原 view stride”配套；若下游自定义 NPU op 只接收裸 <code>data_ptr()</code>、完全不接收 stride，它消费的是物理 flat ABI，此时按 transpose view 的 stride 写会额外做一次物理转置。shape 恰好对称（例如 128×128）时，shape 检查抓不到这种错误。</p>
+                <code>逻辑 Tensor contract → 尊重 stride | 裸指针物理 ABI → 保持约定的 flat storage layout</code>
+          </div>
+          <div className="stride-inspector">
+            <div><h3>用这组属性判断，不要根据函数名猜。</h3><CodeBlock>{`def tensor_info(name, x):
+    print(name)
+    print("shape         =", tuple(x.shape))
+    print("stride        =", tuple(x.stride()))
+    print("storage_offset=", x.storage_offset())
+    print("element_size  =", x.element_size())
+    print("is_contiguous =", x.is_contiguous())
+    print("data_ptr      =", x.data_ptr())
+    print("storage_ptr   =", x.untyped_storage().data_ptr())
+
+def shares_storage(a, b):
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()`}</CodeBlock></div>
+            <ol><li><b>先看 shape + stride + storage_offset</b><span>同 shape 仍可能是 transpose、channels-last、带洞或 overlapping view。</span></li><li><b>再看是否共享 storage</b><span><code>data_ptr</code> 受 offset 影响；比较 <code>untyped_storage().data_ptr()</code> 判断底层 storage。</span></li><li><b>核对 pointer 与 stride 是否来自同一对象</b><span>不能把 contiguous copy 的新 pointer 与原 view 的旧 stride 混用。</span></li><li><b>最后核对消费者 ABI</b><span>自定义 kernel 是否真的接收 stride？若没有，它只会按约定的物理布局解释裸指针。</span></li></ol>
+          </div>
         </section>
 
         <section id="parallel">
@@ -366,7 +717,7 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
           <div className="concept-row">
             <article><b>1D grid</b><code>pid = tl.program_id(0)</code><p>向量、行归约常用。第 pid 个 program 处理一段连续元素或若干 token。</p></article>
             <article><b>2D grid</b><code>pid_m, pid_n</code><p>矩阵 tile 常用。一个 program 对应输出矩阵中的一个二维块。</p></article>
-            <article><b>Persistent grid</b><code>task = pid + k×P</code><p>program 数贴近核心数，循环领取更多任务，减少过多 program 的调度开销。</p></article>
+            <article className="persistent-concept"><b>Persistent grid</b><code>task = pid + k×P</code><p>program 数贴近核心数，同一个 program 留在设备上循环领取任务。</p><dl><div><dt>k</dt><dd>循环轮次，从 0 开始：0、1、2…；不是新的 program_id</dd></div><div><dt>P</dt><dd>Grid 中 program 总数，即 <code>tl.num_programs(0)</code></dd></div><div><dt>停止</dt><dd>当 <code>pid + k×P ≥ total_tasks</code> 时不再领取</dd></div></dl></article>
           </div>
           <ParallelLab />
           <div className="grid-math"><div><span>向量加</span><strong>grid = (ceil(N / BLOCK),)</strong><small>N=98,432；BLOCK=1,024 → 97 programs</small></div><div><span>RMSNorm</span><strong>grid = (num_vectorcore,)</strong><small>total_tasks = ceil(B×L / block_l)，跨步消费</small></div><div><span>二维矩阵</span><strong>grid = (ceil(M/BM), ceil(N/BN))</strong><small>program (pm,pn) → C 的 [BM,BN] tile</small></div></div>
@@ -379,8 +730,8 @@ python3 ./triton-ascend/third_party/ascend/tutorials/01-vector-add.py`}</CodeBlo
         </section>
 
         <section id="cases" className="cases-section">
-          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>从 SGL Kernel NPU 拆 4 个真实算子。</h2><p>每个案例都给出输入、输出、grid、变量含义、PyTorch 参考和计算链；点击源码可回到仓库核对。</p></div>
-          <CaseSimulator />
+          <div className="section-head"><span>06 / PRODUCTION CASES</span><h2>这里选算子，在全屏实验室逐个跑。</h2><p>覆盖当前主分支 {KERNEL_OPS.length} 个含 Triton 的 Python 模块、{TOTAL_TRITON_KERNELS} 个 JIT kernel。点击“全屏详细模拟”，在新窗口逐变量检查 Grid、program、Block lane、GM 地址、load、UB、计算和 store。</p><a className="cases-launch" href="/kernel-lab" target="_blank" rel="noreferrer">新窗口打开 Production Kernel Lab <b>↗</b></a></div>
+          <h3 className="subhead">4 个代表性算子的输入输出速查</h3>
           <div className="case-list">{CASES.map((item) => <article key={item.id}>
             <div className="case-title"><span>{item.no}</span><h3>{item.name}</h3><a href={item.source} target="_blank" rel="noreferrer">源码 ↗</a></div>
             <div className="io-flow"><div><small>INPUT</small><p>{item.input}</p></div><i>→</i><div><small>OUTPUT</small><p>{item.output}</p></div></div>
